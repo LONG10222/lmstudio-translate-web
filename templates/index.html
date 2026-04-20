@@ -18,39 +18,91 @@
                 </p>
             </div>
             <div class="privacy-card">
-                <strong>隐私约束</strong>
-                <p>翻译请求只会从网页发到这台电脑，再由这台电脑发给本机 `LM Studio`。后端会拒绝公网、域名和局域网形式的 LM Studio 地址。</p>
-                {% if pairing_pin %}
-                <div class="token-box">
-                    <span>6 位接入 PIN</span>
-                    <code id="pairing_pin">{{ pairing_pin }}</code>
-                    <div class="inline-actions">
+                <div class="access-summary-row">
+                    <div class="access-summary-copy">
+                        <strong>局域网接入</strong>
+                        <p class="privacy-summary">默认只走本机 LM Studio。需要时再展开接入、证书和跨系统说明。</p>
+                    </div>
+                    {% if pairing_pin %}
+                    <div class="access-pill-group">
+                        <div class="access-pill">
+                            <span>6 位 PIN</span>
+                            <code id="pairing_pin">{{ pairing_pin }}</code>
+                        </div>
                         <button class="secondary compact" type="button" id="copy_pin">复制 PIN</button>
-                        <button class="secondary compact" type="button" id="refresh_pin">重新生成 PIN</button>
                     </div>
-                    <small id="pairing_pin_expires" class="field-help">有效期至：{{ pairing_pin_expires_at_display }}</small>
+                    {% endif %}
                 </div>
-                <div class="lan-box">
-                    <span>HTTPS 接入准备</span>
-                    <p>更方便的做法是直接下载 Windows 一键接入包。其他电脑解压后运行导入脚本，再访问下面任一 HTTPS 地址，首次登录只需输入上面的 6 位 PIN。</p>
-                    <div class="inline-actions">
-                        <a class="button-link secondary compact" href="{{ url_for('download_ca_cert') }}">下载根证书</a>
-                        <a class="button-link secondary compact" href="{{ url_for('download_windows_bundle') }}">下载 Windows 一键接入包</a>
+                <details class="access-details">
+                    <summary>管理局域网接入与证书</summary>
+                    <div class="access-details-body">
+                        {% if pairing_pin %}
+                        <div class="access-grid">
+                            <div class="lan-box">
+                                <span>接入控制</span>
+                                <p>其他电脑首次访问时只需输入当前 6 位 PIN。登录后可通过受信设备会话继续使用。</p>
+                                <div class="inline-actions">
+                                    <button class="secondary compact" type="button" id="refresh_pin">重新生成 PIN</button>
+                                </div>
+                                <small id="pairing_pin_expires" class="field-help">有效期至：{{ pairing_pin_expires_at_display }}</small>
+                            </div>
+                            <div class="lan-box">
+                                <span>证书与下载</span>
+                                <p>Windows 可直接使用一键接入包。macOS 和 Linux 也能连接，但仍需要先信任这台主机生成的根证书。</p>
+                                <div class="inline-actions">
+                                    <a class="button-link secondary compact" href="{{ url_for('download_ca_cert') }}">下载根证书</a>
+                                    <a class="button-link secondary compact" href="{{ url_for('download_windows_bundle') }}">下载 Windows 一键接入包</a>
+                                </div>
+                                <div class="fingerprint-box">
+                                    <span>根证书 SHA-256 指纹</span>
+                                    <code id="ca_thumbprint">{{ ca_thumbprint_display }}</code>
+                                    <div class="inline-actions">
+                                        <button class="secondary compact" type="button" id="copy_thumbprint">复制指纹</button>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                        {% endif %}
+                        {% if lan_urls %}
+                        <div class="lan-box">
+                            <span>局域网地址</span>
+                            <p>其他设备在信任根证书后，打开下面任一 HTTPS 地址，再输入上面的 6 位 PIN。</p>
+                            <ul>
+                                {% for lan_url in lan_urls %}
+                                <li><code>{{ lan_url }}</code></li>
+                                {% endfor %}
+                            </ul>
+                        </div>
+                        {% endif %}
+                        <div class="os-help-grid">
+                            <div class="os-card">
+                                <span>Windows</span>
+                                <p>优先使用一键接入包。解压后运行 <code>Install-RootCA.ps1</code>，再打开上面的 HTTPS 地址。</p>
+                            </div>
+                            <div class="os-card">
+                                <span>macOS</span>
+                                <p>下载根证书后导入钥匙串，并把它设为“始终信任”。也可以用命令行导入系统信任区。</p>
+                                <code>sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain lmstudio-translate-root-ca.crt</code>
+                            </div>
+                            <div class="os-card">
+                                <span>Linux</span>
+                                <p>先导入系统证书存储，再访问 HTTPS 地址。Firefox 在部分发行版上可能还要单独导入证书。</p>
+                                <code>sudo cp lmstudio-translate-root-ca.crt /usr/local/share/ca-certificates/ && sudo update-ca-certificates</code>
+                            </div>
+                        </div>
+                        <details class="privacy-details">
+                            <summary>显示隐私约束</summary>
+                            <div class="privacy-details-body">
+                                <p>翻译请求只会从网页发到这台电脑，再由这台电脑发给本机 <code>LM Studio</code>。后端会拒绝公网、域名和局域网形式的 LM Studio 地址。</p>
+                                <p>如果其他电脑要通过局域网访问，为了防抓包和中间人篡改，仍然需要先信任这台主机生成的根证书。网页 PIN 只能控制访问权限，不能替代 TLS 证书信任。</p>
+                            </div>
+                        </details>
+                        <div class="note-box">
+                            <strong>为什么不能只靠网页认证</strong>
+                            <p>因为浏览器在建立安全连接之前，就必须先判断这台主机的证书是否可信。只靠网页里的 PIN 或登录表单，不能解决抓包和中间人篡改问题。</p>
+                        </div>
                     </div>
-                    <small class="field-help">根证书 SHA-256 指纹：{{ ca_thumbprint_display }}</small>
-                </div>
-                {% endif %}
-                {% if lan_urls %}
-                <div class="lan-box">
-                    <span>局域网接入方式</span>
-                    <p>局域网内其他设备导入根证书后，打开下面任一地址，再输入上面的 6 位 PIN：</p>
-                    <ul>
-                        {% for lan_url in lan_urls %}
-                        <li><code>{{ lan_url }}</code></li>
-                        {% endfor %}
-                    </ul>
-                </div>
-                {% endif %}
+                </details>
             </div>
         </header>
 
@@ -195,6 +247,8 @@
             refreshPin: document.getElementById("refresh_pin"),
             pairingPin: document.getElementById("pairing_pin"),
             pairingPinExpires: document.getElementById("pairing_pin_expires"),
+            caThumbprint: document.getElementById("ca_thumbprint"),
+            copyThumbprint: document.getElementById("copy_thumbprint"),
         };
 
         let progressTimer = null;
@@ -410,6 +464,9 @@
         }
         if (elements.refreshPin) {
             elements.refreshPin.addEventListener("click", regeneratePin);
+        }
+        if (elements.copyThumbprint && elements.caThumbprint) {
+            elements.copyThumbprint.addEventListener("click", () => copyText(elements.caThumbprint.textContent, "根证书指纹已复制。"));
         }
 
         setIdleProgress();

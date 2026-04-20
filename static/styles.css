@@ -78,15 +78,140 @@ h1 {
     box-shadow: var(--shadow);
 }
 
+.access-summary-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 14px;
+}
+
+.access-summary-copy {
+    min-width: 0;
+}
+
+.access-pill-group {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+    gap: 8px;
+}
+
+.access-pill {
+    display: grid;
+    gap: 4px;
+    min-width: 148px;
+    padding: 10px 12px;
+    background: rgba(255, 255, 255, 0.72);
+    border: 1px solid rgba(29, 36, 48, 0.08);
+    border-radius: 14px;
+}
+
+.access-pill span {
+    display: block;
+    font-size: 0.74rem;
+    font-weight: 700;
+    color: var(--muted);
+}
+
+.access-pill code {
+    font-size: 1rem;
+}
+
 .privacy-card strong {
     display: block;
-    margin-bottom: 8px;
+    margin-bottom: 6px;
 }
 
 .privacy-card p {
     margin: 0;
     color: var(--muted);
     line-height: 1.6;
+}
+
+.privacy-summary {
+    font-size: 0.94rem;
+}
+
+.access-details {
+    margin-top: 14px;
+    padding: 12px 14px;
+    background: rgba(255, 255, 255, 0.62);
+    border: 1px solid rgba(29, 36, 48, 0.08);
+    border-radius: 16px;
+}
+
+.access-details summary {
+    cursor: pointer;
+    list-style: none;
+    font-size: 0.94rem;
+    font-weight: 700;
+    color: var(--accent-strong);
+}
+
+.access-details summary::-webkit-details-marker {
+    display: none;
+}
+
+.access-details summary::after {
+    content: "展开";
+    margin-left: 8px;
+    color: var(--muted);
+    font-weight: 500;
+}
+
+.access-details[open] summary::after {
+    content: "收起";
+}
+
+.access-details-body {
+    display: grid;
+    gap: 14px;
+    margin-top: 14px;
+}
+
+.access-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 14px;
+}
+
+.privacy-details {
+    padding: 12px 14px;
+    background: rgba(248, 244, 236, 0.88);
+    border: 1px solid rgba(29, 36, 48, 0.08);
+    border-radius: 14px;
+}
+
+.privacy-details summary {
+    cursor: pointer;
+    list-style: none;
+    font-size: 0.9rem;
+    font-weight: 700;
+    color: var(--accent-strong);
+}
+
+.privacy-details summary::-webkit-details-marker {
+    display: none;
+}
+
+.privacy-details summary::after {
+    content: "展开";
+    margin-left: 8px;
+    color: var(--muted);
+    font-weight: 500;
+}
+
+.privacy-details[open] summary::after {
+    content: "收起";
+}
+
+.privacy-details-body {
+    display: grid;
+    gap: 10px;
+    margin-top: 12px;
+    padding-top: 12px;
+    border-top: 1px solid rgba(29, 36, 48, 0.08);
 }
 
 .token-box,
@@ -133,6 +258,82 @@ h1 {
 
 .lan-box li {
     margin: 6px 0;
+}
+
+.os-help-grid {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 14px;
+}
+
+.os-card,
+.note-box {
+    display: grid;
+    gap: 8px;
+    padding: 14px;
+    background: rgba(255, 255, 255, 0.72);
+    border: 1px solid rgba(29, 36, 48, 0.08);
+    border-radius: 16px;
+}
+
+.os-card span {
+    display: block;
+    font-size: 0.84rem;
+    font-weight: 700;
+    color: var(--muted);
+}
+
+.os-card p,
+.note-box p {
+    margin: 0;
+    color: var(--muted);
+    line-height: 1.55;
+}
+
+.os-card code {
+    display: block;
+    padding: 10px 12px;
+    border-radius: 12px;
+    background: #f5f1ea;
+    font-size: 0.78rem;
+    line-height: 1.55;
+    white-space: normal;
+    overflow-wrap: anywhere;
+    word-break: break-word;
+}
+
+.note-box strong {
+    margin: 0;
+}
+
+.fingerprint-box {
+    display: grid;
+    gap: 8px;
+    margin-top: 12px;
+    padding: 12px;
+    background: rgba(245, 241, 234, 0.88);
+    border-radius: 14px;
+    border: 1px solid rgba(29, 36, 48, 0.08);
+}
+
+.fingerprint-box span {
+    display: block;
+    font-size: 0.8rem;
+    font-weight: 700;
+    color: var(--muted);
+}
+
+.fingerprint-box code {
+    display: block;
+    max-width: 100%;
+    padding: 10px 12px;
+    border-radius: 12px;
+    background: white;
+    font-size: 0.8rem;
+    line-height: 1.55;
+    white-space: normal;
+    overflow-wrap: anywhere;
+    word-break: break-word;
 }
 
 .panel {
@@ -378,8 +579,19 @@ button:disabled {
     .hero,
     .grid-2,
     .grid-4,
-    .editor-grid {
+    .editor-grid,
+    .access-grid,
+    .os-help-grid {
         grid-template-columns: 1fr;
+    }
+
+    .access-summary-row {
+        align-items: stretch;
+        flex-direction: column;
+    }
+
+    .access-pill-group {
+        justify-content: flex-start;
     }
 }
 
