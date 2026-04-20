@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import hashlib
 import ipaddress
+import io
 import json
 import secrets
 import socket
 import ssl
+import zipfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from socketserver import ThreadingMixIn
@@ -561,6 +563,48 @@ def format_thumbprint(hex_value: str) -> str:
     return ":".join(hex_value[i : i + 2] for i in range(0, len(hex_value), 2))
 
 
+def build_windows_onboarding_bundle(runtime: dict) -> bytes:
+    cert_bytes = CA_CERT_PATH.read_bytes()
+    lan_urls = runtime.get("lan_urls", [])
+    lan_url = lan_urls[0] if lan_urls else runtime["local_url"]
+    bundle_readme = f"""LM Studio Translate Web 局域网接入包
+
+1. 先双击 Install-RootCA.ps1
+2. 按提示把根证书导入当前 Windows 用户的受信任根证书颁发机构
+3. 导入完成后，在这台电脑打开：
+   {lan_url}
+4. 首次登录时输入主机页面显示的 6 位 PIN
+
+根证书 SHA-256 指纹：
+{runtime["ca_thumbprint_display"]}
+"""
+    install_script = f"""$ErrorActionPreference = "Stop"
+
+$scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+$certPath = Join-Path $scriptDir "lmstudio-translate-root-ca.crt"
+
+if (-not (Test-Path $certPath)) {{
+    throw "Certificate file not found: $certPath"
+}}
+
+Import-Certificate -FilePath $certPath -CertStoreLocation Cert:\\CurrentUser\\Root | Out-Null
+
+Write-Host ""
+Write-Host "根证书已导入当前用户信任区。" -ForegroundColor Green
+Write-Host "下一步：" -ForegroundColor Cyan
+Write-Host "1. 打开 {lan_url}"
+Write-Host "2. 输入主机页面显示的 6 位 PIN"
+Write-Host ""
+Pause
+"""
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("lmstudio-translate-root-ca.crt", cert_bytes)
+        archive.writestr("Install-RootCA.ps1", install_script.encode("utf-8"))
+        archive.writestr("README.txt", bundle_readme.encode("utf-8"))
+    return buffer.getvalue()
+
+
 def prepare_runtime() -> dict:
     security = load_security_config()
     pin, pin_expires_at = ensure_active_pairing_pin(security)
@@ -725,6 +769,19 @@ def download_ca_cert():
         download_name="lmstudio-translate-root-ca.crt",
         mimetype="application/x-x509-ca-cert",
     )
+
+
+@app.get("/admin/windows-bundle")
+def download_windows_bundle():
+    if not is_local_admin_request():
+        return make_response("只允许在本机下载接入包。", 403)
+
+    runtime = prepare_runtime()
+    bundle = build_windows_onboarding_bundle(runtime)
+    response = make_response(bundle)
+    response.headers["Content-Type"] = "application/zip"
+    response.headers["Content-Disposition"] = 'attachment; filename="lmstudio-lan-windows-bundle.zip"'
+    return response
 
 
 @app.post("/api/models")

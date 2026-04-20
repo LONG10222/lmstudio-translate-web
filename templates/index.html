@@ -32,9 +32,10 @@
                 </div>
                 <div class="lan-box">
                     <span>HTTPS 接入准备</span>
-                    <p>先在其他电脑导入本机根证书，再访问下面任一 HTTPS 地址，首次登录只需输入上面的 6 位 PIN。</p>
+                    <p>更方便的做法是直接下载 Windows 一键接入包。其他电脑解压后运行导入脚本，再访问下面任一 HTTPS 地址，首次登录只需输入上面的 6 位 PIN。</p>
                     <div class="inline-actions">
                         <a class="button-link secondary compact" href="{{ url_for('download_ca_cert') }}">下载根证书</a>
+                        <a class="button-link secondary compact" href="{{ url_for('download_windows_bundle') }}">下载 Windows 一键接入包</a>
                     </div>
                     <small class="field-help">根证书 SHA-256 指纹：{{ ca_thumbprint_display }}</small>
                 </div>
