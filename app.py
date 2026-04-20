@@ -4,7 +4,9 @@ import hashlib
 import ipaddress
 import io
 import json
+import math
 import secrets
+import re
 import socket
 import ssl
 import threading
@@ -50,6 +52,10 @@ BOOTSTRAP_PORT = 7871
 PIN_TTL_MINUTES = 10
 TRUST_DEVICE_DAYS = 30
 TEMP_SESSION_HOURS = 12
+MIN_TRANSLATION_MAX_TOKENS = 512
+MAX_TRANSLATION_MAX_TOKENS = 4096
+MIN_CHUNK_CHARS = 700
+MAX_CHUNK_CHARS = 3200
 
 LM_STUDIO_BASE_URL_CANDIDATES = [
     "http://127.0.0.1:1234/v1",
@@ -329,6 +335,7 @@ def build_messages(text: str, source_lang: str, target_lang: str) -> list[dict]:
     user_prompt = (
         "You are a professional translator.\n"
         "Translate the text faithfully and naturally.\n"
+        "Preserve paragraph structure where practical.\n"
         "Do not explain. Do not summarize. Output translation only.\n\n"
         f"Source language: {source_text}\n"
         f"Target language: {target_text}\n"
@@ -338,7 +345,64 @@ def build_messages(text: str, source_lang: str, target_lang: str) -> list[dict]:
     return [{"role": "user", "content": user_prompt}]
 
 
-def translate_text(config: dict, base_url: str, text: str) -> str:
+def estimate_chunk_char_limit(config: dict) -> int:
+    configured_tokens = int(config.get("max_tokens", DEFAULT_CONFIG["max_tokens"]))
+    estimated_chars = configured_tokens * 4
+    return max(MIN_CHUNK_CHARS, min(MAX_CHUNK_CHARS, estimated_chars))
+
+
+def estimate_completion_tokens(config: dict, text: str) -> int:
+    configured_tokens = int(config.get("max_tokens", DEFAULT_CONFIG["max_tokens"]))
+    estimated_tokens = math.ceil(len(text) / 3)
+    return max(
+        configured_tokens,
+        min(MAX_TRANSLATION_MAX_TOKENS, max(MIN_TRANSLATION_MAX_TOKENS, estimated_tokens)),
+    )
+
+
+def split_text_for_translation(text: str, max_chars: int) -> list[str]:
+    normalized = text.replace("\r\n", "\n").strip()
+    if not normalized:
+        return []
+
+    chunks: list[str] = []
+    start = 0
+    boundary_markers = ["\n\n", "\n", "。", "！", "？", "!", "?", "；", ";", "，", ",", " "]
+
+    while start < len(normalized):
+        remaining = len(normalized) - start
+        if remaining <= max_chars:
+            tail = normalized[start:].strip()
+            if tail:
+                chunks.append(tail)
+            break
+
+        window = normalized[start : start + max_chars + 1]
+        split_at = -1
+        search_from = max_chars // 2
+        for marker in boundary_markers:
+            index = window.rfind(marker, search_from)
+            if index != -1:
+                split_at = max(split_at, index + len(marker))
+
+        if split_at <= 0:
+            split_at = max_chars
+
+        chunk = window[:split_at].strip()
+        if not chunk:
+            chunk = window[:max_chars].strip()
+            split_at = max_chars
+
+        chunks.append(chunk)
+        start += split_at
+        while start < len(normalized) and normalized[start].isspace():
+            start += 1
+
+    return chunks
+
+
+def request_translation(config: dict, base_url: str, text: str) -> str:
+    max_tokens = estimate_completion_tokens(config, text)
     with make_session() as session:
         response = session.post(
             f"{base_url}/chat/completions",
@@ -352,13 +416,26 @@ def translate_text(config: dict, base_url: str, text: str) -> str:
                     text, config["source_lang"], config["target_lang"]
                 ),
                 "temperature": config["temperature"],
-                "max_tokens": config["max_tokens"],
+                "max_tokens": max_tokens,
             },
             timeout=int(config["request_timeout"]),
         )
     response.raise_for_status()
     payload = response.json()
-    return payload["choices"][0]["message"]["content"].strip()
+    translated = payload["choices"][0]["message"]["content"].strip()
+    if not translated:
+        raise ValueError("LM Studio 返回了空结果。请尝试更换模型，或调大最大输出 Tokens。")
+    return translated
+
+
+def translate_text(config: dict, base_url: str, text: str) -> tuple[str, int]:
+    chunks = split_text_for_translation(text, estimate_chunk_char_limit(config))
+    if not chunks:
+        return "", 0
+
+    translated_chunks = [request_translation(config, base_url, chunk) for chunk in chunks]
+    joiner = "\n\n" if len(translated_chunks) > 1 else ""
+    return joiner.join(translated_chunks), len(translated_chunks)
 
 
 def sanitize_config(payload: dict) -> dict:
@@ -1038,17 +1115,22 @@ def api_translate():
     save_config(config)
 
     try:
-        translated_text = translate_text(config, config["base_url"], source_text)
+        translated_text, chunk_count = translate_text(config, config["base_url"], source_text)
     except Exception as exc:
         return jsonify({"ok": False, "error": format_request_error(exc, "翻译")}), 400
+
+    message = "翻译完成。"
+    if chunk_count > 1:
+        message = f"长文本已自动分段翻译，共 {chunk_count} 段。"
 
     return jsonify(
         {
             "ok": True,
             "translated_text": translated_text,
             "base_url": config["base_url"],
-            "message": "翻译完成。",
+            "message": message,
             "model_name": config["model_name"],
+            "chunk_count": chunk_count,
         }
     )
 

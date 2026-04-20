@@ -178,7 +178,7 @@
                         <label>
                             <span>最大输出 Tokens</span>
                             <input type="number" id="max_tokens" min="64" max="8192" value="{{ config.max_tokens }}">
-                            <small class="field-help">译文较长时可适当调大。</small>
+                            <small class="field-help">长文本会自动分段翻译。这个值过低时，单段译文仍可能被截断。</small>
                         </label>
                     </div>
 
