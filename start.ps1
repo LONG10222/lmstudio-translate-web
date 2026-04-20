@@ -29,5 +29,30 @@ for ($i = 0; $i -lt 50; $i++) {
     }
 }
 
+Write-Host ""
+Write-Host "Local URL: $url"
+
+$lanIps = Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+    Where-Object {
+        $_.IPAddress -notlike "127.*" -and
+        ($_.IPAddress -match '^(10\.|192\.168\.|172\.(1[6-9]|2\d|3[0-1])\.)')
+    } |
+    Select-Object -ExpandProperty IPAddress -Unique
+
+foreach ($ip in $lanIps) {
+    Write-Host "LAN URL: http://$ip:7870/"
+}
+
+$securityPath = Join-Path $projectRoot "security.json"
+if (Test-Path $securityPath) {
+    try {
+        $security = Get-Content -Encoding UTF8 $securityPath | ConvertFrom-Json
+        if ($security.lan_access_token) {
+            Write-Host "LAN Access Token: $($security.lan_access_token)"
+        }
+    } catch {
+    }
+}
+
 Start-Process $url
 Wait-Process -Id $server.Id

@@ -2,19 +2,29 @@ from __future__ import annotations
 
 import ipaddress
 import json
+import secrets
 from pathlib import Path
 from urllib.parse import urlparse
 
 import requests
-from flask import Flask, jsonify, render_template, request
+from flask import Flask, jsonify, make_response, redirect, render_template, request, url_for
 from requests import exceptions as request_exceptions
 
 
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = BASE_DIR / "config.json"
+SECURITY_PATH = BASE_DIR / "security.json"
+COOKIE_NAME = "lmstudio_translate_session"
+APP_HOST = "0.0.0.0"
+APP_PORT = 7870
+LM_STUDIO_BASE_URL_CANDIDATES = [
+    "http://127.0.0.1:1234/v1",
+    "http://localhost:1234/v1",
+    "http://[::1]:1234/v1",
+]
 
 DEFAULT_CONFIG = {
-    "base_url": "http://127.0.0.1:1234/v1",
+    "base_url": "",
     "api_key": "lm-studio",
     "model_name": "",
     "temperature": 0.2,
@@ -61,15 +71,34 @@ def save_config(config: dict) -> None:
         json.dump(config, file, ensure_ascii=False, indent=2)
 
 
+def load_security_config() -> dict:
+    if SECURITY_PATH.exists():
+        with open(SECURITY_PATH, "r", encoding="utf-8") as file:
+            security = json.load(file)
+    else:
+        security = {}
+
+    if not security.get("lan_access_token"):
+        security["lan_access_token"] = secrets.token_urlsafe(24)
+        save_security_config(security)
+
+    return security
+
+
+def save_security_config(security: dict) -> None:
+    with open(SECURITY_PATH, "w", encoding="utf-8") as file:
+        json.dump(security, file, ensure_ascii=False, indent=2)
+
+
 def normalize_base_url(base_url: str) -> str:
-    url = (base_url or "").strip()
-    if not url:
-        url = DEFAULT_CONFIG["base_url"]
-    return url.rstrip("/")
+    return (base_url or "").strip().rstrip("/")
 
 
 def ensure_local_base_url(base_url: str) -> str:
     normalized = normalize_base_url(base_url)
+    if not normalized:
+        raise ValueError("未找到可用的本机 LM Studio 地址。")
+
     parsed = urlparse(normalized)
 
     if parsed.scheme not in {"http", "https"}:
@@ -98,21 +127,42 @@ def make_session() -> requests.Session:
     return session
 
 
-def list_models(config: dict) -> tuple[list[str], str | None]:
-    try:
-        base_url = ensure_local_base_url(config["base_url"])
-        with make_session() as session:
-            response = session.get(
-                f"{base_url}/models",
-                headers={"Authorization": f"Bearer {config['api_key']}"},
-                timeout=10,
-            )
-        response.raise_for_status()
-        payload = response.json()
-        models = [item["id"] for item in payload.get("data", []) if item.get("id")]
-        return models, None
-    except Exception as exc:
-        return [], format_request_error(exc, "读取模型列表")
+def probe_models(base_url: str, api_key: str, timeout: int = 10) -> list[str]:
+    with make_session() as session:
+        response = session.get(
+            f"{base_url}/models",
+            headers={"Authorization": f"Bearer {api_key}"},
+            timeout=timeout,
+        )
+    response.raise_for_status()
+    payload = response.json()
+    return [item["id"] for item in payload.get("data", []) if item.get("id")]
+
+
+def resolve_lmstudio_base_url(config: dict) -> tuple[str | None, list[str], str | None]:
+    configured_base_url = normalize_base_url(config.get("base_url", ""))
+    candidates: list[str] = []
+
+    if configured_base_url:
+        try:
+            candidates.append(ensure_local_base_url(configured_base_url))
+        except Exception as exc:
+            return None, [], format_request_error(exc, "读取模型列表")
+    else:
+        candidates.extend(LM_STUDIO_BASE_URL_CANDIDATES)
+
+    last_exc: Exception | None = None
+    for candidate in candidates:
+        try:
+            safe_base_url = ensure_local_base_url(candidate)
+            models = probe_models(safe_base_url, config["api_key"], timeout=4)
+            return safe_base_url, models, None
+        except Exception as exc:
+            last_exc = exc
+
+    if last_exc is None:
+        last_exc = ValueError("未找到可用的本机 LM Studio 地址。")
+    return None, [], format_request_error(last_exc, "读取模型列表")
 
 
 def pick_default_model(models: list[str]) -> str:
@@ -131,9 +181,9 @@ def format_request_error(exc: Exception, action: str) -> str:
         return f"{action}失败：{exc}"
     if isinstance(exc, request_exceptions.ConnectionError):
         return (
-            f"{action}失败：无法连接到 LM Studio 本地接口。"
-            "请确认 LM Studio 已启动，并且本地服务正在监听 "
-            "http://127.0.0.1:1234 。"
+            f"{action}失败：无法连接到本机 LM Studio 接口。"
+            "系统已自动搜索常见回环地址，但都没有连通。"
+            "请确认 LM Studio 已启动，并且本地服务正在监听 1234 端口。"
         )
     if isinstance(exc, request_exceptions.Timeout):
         return f"{action}失败：LM Studio 响应超时。"
@@ -161,8 +211,7 @@ def build_messages(text: str, source_lang: str, target_lang: str) -> list[dict]:
     return [{"role": "user", "content": user_prompt}]
 
 
-def translate_text(config: dict, text: str) -> str:
-    base_url = ensure_local_base_url(config["base_url"])
+def translate_text(config: dict, base_url: str, text: str) -> str:
     with make_session() as session:
         response = session.post(
             f"{base_url}/chat/completions",
@@ -206,13 +255,76 @@ def sanitize_config(payload: dict) -> dict:
     return config
 
 
+def get_remote_ip() -> ipaddress._BaseAddress | None:
+    if not request.remote_addr:
+        return None
+    try:
+        return ipaddress.ip_address(request.remote_addr)
+    except ValueError:
+        return None
+
+
+def is_private_client(ip: ipaddress._BaseAddress | None) -> bool:
+    if ip is None:
+        return False
+    return ip.is_loopback or ip.is_private
+
+
+def is_authorized_client(security: dict) -> bool:
+    remote_ip = get_remote_ip()
+    if remote_ip and remote_ip.is_loopback:
+        return True
+    return request.cookies.get(COOKIE_NAME) == security["lan_access_token"]
+
+
+def is_admin_view(security: dict) -> bool:
+    remote_ip = get_remote_ip()
+    return bool(remote_ip and remote_ip.is_loopback and is_authorized_client(security))
+
+
+@app.before_request
+def restrict_client_network():
+    remote_ip = get_remote_ip()
+    if not is_private_client(remote_ip):
+        return make_response("只允许本机或局域网私有地址访问。", 403)
+
+    security = load_security_config()
+    if request.endpoint and request.endpoint.startswith("api_") and not is_authorized_client(security):
+        return jsonify({"ok": False, "error": "未授权。请先在局域网访问页输入访问令牌。"}), 403
+
+
+@app.after_request
+def apply_security_headers(response):
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    response.headers["Content-Security-Policy"] = (
+        "default-src 'self'; "
+        "script-src 'self' 'unsafe-inline'; "
+        "style-src 'self' 'unsafe-inline'; "
+        "img-src 'self' data:; "
+        "base-uri 'self'; "
+        "frame-ancestors 'none'; "
+        "form-action 'self'"
+    )
+    return response
+
+
 @app.get("/")
 def index():
+    security = load_security_config()
+    if not is_authorized_client(security):
+        return render_template("login.html", error_message="")
+
     config = load_config()
-    models, model_error = list_models(config)
-    if not config["model_name"] and models:
+    base_url, models, model_error = resolve_lmstudio_base_url(config)
+    if base_url:
+        config["base_url"] = base_url
+    if models and (not config["model_name"] or config["model_name"] not in models):
         config["model_name"] = pick_default_model(models)
-        save_config(config)
+    save_config(config)
 
     return render_template(
         "index.html",
@@ -220,29 +332,57 @@ def index():
         models=models,
         language_options=LANGUAGE_OPTIONS,
         initial_error=model_error or "",
+        lan_access_token=security["lan_access_token"] if is_admin_view(security) else "",
     )
+
+
+@app.post("/login")
+def login():
+    security = load_security_config()
+    token = request.form.get("access_token", "").strip()
+    if token != security["lan_access_token"]:
+        return render_template("login.html", error_message="访问令牌错误。"), 403
+
+    response = make_response(redirect(url_for("index")))
+    response.set_cookie(
+        COOKIE_NAME,
+        token,
+        max_age=12 * 60 * 60,
+        httponly=True,
+        samesite="Strict",
+        secure=request.is_secure,
+    )
+    return response
+
+
+@app.post("/logout")
+def logout():
+    response = make_response(redirect(url_for("index")))
+    response.delete_cookie(COOKIE_NAME)
+    return response
 
 
 @app.post("/api/models")
 def api_models():
     payload = request.get_json(silent=True) or {}
     config = sanitize_config(payload)
-    save_config(config)
 
-    models, error_message = list_models(config)
+    base_url, models, error_message = resolve_lmstudio_base_url(config)
     if error_message:
         return jsonify({"ok": False, "error": error_message}), 400
 
-    if not config["model_name"] and models:
+    config["base_url"] = base_url or config["base_url"]
+    if models and (not config["model_name"] or config["model_name"] not in models):
         config["model_name"] = pick_default_model(models)
-        save_config(config)
+    save_config(config)
 
     return jsonify(
         {
             "ok": True,
             "models": models,
+            "base_url": config["base_url"],
             "model_name": config["model_name"],
-            "message": f"已刷新模型列表，共 {len(models)} 个模型。",
+            "message": f"已自动探测并刷新模型列表，共 {len(models)} 个模型。",
         }
     )
 
@@ -256,11 +396,12 @@ def api_translate():
     if not source_text:
         return jsonify({"ok": False, "error": "请输入要翻译的文本。"}), 400
 
-    models, error_message = list_models(config)
+    base_url, models, error_message = resolve_lmstudio_base_url(config)
     if error_message:
         return jsonify({"ok": False, "error": error_message}), 400
 
-    if not config["model_name"]:
+    config["base_url"] = base_url or config["base_url"]
+    if models and (not config["model_name"] or config["model_name"] not in models):
         config["model_name"] = pick_default_model(models)
 
     if not config["model_name"]:
@@ -269,7 +410,7 @@ def api_translate():
     save_config(config)
 
     try:
-        translated_text = translate_text(config, source_text)
+        translated_text = translate_text(config, config["base_url"], source_text)
     except Exception as exc:
         return jsonify({"ok": False, "error": format_request_error(exc, "翻译")}), 400
 
@@ -277,6 +418,7 @@ def api_translate():
         {
             "ok": True,
             "translated_text": translated_text,
+            "base_url": config["base_url"],
             "message": "翻译完成。",
             "model_name": config["model_name"],
         }
@@ -284,4 +426,5 @@ def api_translate():
 
 
 if __name__ == "__main__":
-    app.run(host="127.0.0.1", port=7870, debug=False)
+    load_security_config()
+    app.run(host=APP_HOST, port=APP_PORT, debug=False)

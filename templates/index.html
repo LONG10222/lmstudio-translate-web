@@ -13,13 +13,20 @@
                 <p class="eyebrow">Local LLM Translation</p>
                 <h1>LM Studio 本地翻译台</h1>
                 <p class="subtext">
-                    翻译请求只允许发送到本机回环地址，默认锁定为本地 LM Studio。
-                    页面支持模型刷新、一键粘贴、一键复制，以及翻译进度反馈。
+                    页面现在可以通过局域网访问，但后端仍然只允许连接本机 LM Studio 回环地址。
+                    同时启用局域网访问令牌、Strict Cookie 和无代理出站，尽量降低未授权访问与内容被转发的风险。
                 </p>
             </div>
             <div class="privacy-card">
                 <strong>隐私约束</strong>
-                <p>后端只接受 `localhost / 127.0.0.1 / ::1`，并忽略系统代理，避免把翻译内容转发到外部网络。</p>
+                <p>翻译请求只会从网页发到这台电脑，再由这台电脑发给本机 `LM Studio`。后端会拒绝公网、域名和局域网形式的 LM Studio 地址。</p>
+                {% if lan_access_token %}
+                <div class="token-box">
+                    <span>局域网访问令牌</span>
+                    <code id="lan_access_token">{{ lan_access_token }}</code>
+                    <button class="secondary compact" type="button" id="copy_token">复制令牌</button>
+                </div>
+                {% endif %}
             </div>
         </header>
 
@@ -29,8 +36,8 @@
                     <div class="grid grid-2">
                         <label>
                             <span>LM Studio Base URL</span>
-                            <input type="text" id="base_url" value="{{ config.base_url }}">
-                            <small class="field-help">只允许本机地址，例如 `http://127.0.0.1:1234/v1`。</small>
+                            <input type="text" id="base_url" value="{{ config.base_url }}" placeholder="留空时自动搜索本机 LM Studio">
+                            <small class="field-help">默认会自动搜索 `127.0.0.1 / localhost / ::1` 上常见的 LM Studio 地址。</small>
                         </label>
                         <label>
                             <span>API Key</span>
@@ -49,13 +56,13 @@
                                     <option value="{{ model }}" {% if model == config.model_name %}selected{% endif %}>{{ model }}</option>
                                     {% endfor %}
                                 </select>
-                                <button class="secondary compact" type="button" id="refresh_models">刷新模型</button>
+                                <button class="secondary compact" type="button" id="refresh_models">自动搜索并刷新</button>
                             </div>
                         </label>
                         <label>
                             <span>模型名</span>
                             <input type="text" id="model_name" value="{{ config.model_name }}">
-                            <small class="field-help">可直接手动改成 LM Studio 已加载的任意模型名。</small>
+                            <small class="field-help">可直接手动填写 LM Studio 已加载的任意模型名。</small>
                         </label>
                     </div>
 
@@ -79,7 +86,7 @@
                         <label>
                             <span>温度</span>
                             <input type="number" id="temperature" step="0.1" min="0" max="2" value="{{ config.temperature }}">
-                            <small class="field-help">数值越低越稳定。翻译场景通常建议 0 到 0.3。</small>
+                            <small class="field-help">数值越低越稳定。翻译通常建议 0 到 0.3。</small>
                         </label>
                         <label>
                             <span>最大输出 Tokens</span>
@@ -127,6 +134,9 @@
                     </div>
 
                     <div class="actions">
+                        <form method="post" action="{{ url_for('logout') }}">
+                            <button class="secondary" type="submit">退出局域网会话</button>
+                        </form>
                         <button class="secondary" type="button" id="clear_all">清空</button>
                         <button class="primary" type="button" id="translate_button">开始翻译</button>
                     </div>
@@ -157,6 +167,8 @@
             copySource: document.getElementById("copy_source"),
             copyTarget: document.getElementById("copy_target"),
             clearAll: document.getElementById("clear_all"),
+            copyToken: document.getElementById("copy_token"),
+            lanToken: document.getElementById("lan_access_token"),
         };
 
         let progressTimer = null;
@@ -224,6 +236,7 @@
                     "Content-Type": "application/json",
                 },
                 body: JSON.stringify(payload),
+                credentials: "same-origin",
             });
             const data = await response.json();
             if (!response.ok || !data.ok) {
@@ -263,6 +276,9 @@
                 if (data.model_name) {
                     elements.modelName.value = data.model_name;
                 }
+                if (data.base_url) {
+                    elements.baseUrl.value = data.base_url;
+                }
                 setMessage(data.message, "success");
             } catch (error) {
                 setMessage(error.message, "error");
@@ -283,6 +299,9 @@
                 elements.translatedText.value = data.translated_text;
                 if (data.model_name) {
                     elements.modelName.value = data.model_name;
+                }
+                if (data.base_url) {
+                    elements.baseUrl.value = data.base_url;
                 }
                 finishProgress(true);
                 setMessage(data.message, "success");
@@ -333,6 +352,9 @@
         elements.copySource.addEventListener("click", () => copyText(elements.sourceText.value, "原文已复制。"));
         elements.copyTarget.addEventListener("click", () => copyText(elements.translatedText.value, "译文已复制。"));
         elements.clearAll.addEventListener("click", clearEditors);
+        if (elements.copyToken && elements.lanToken) {
+            elements.copyToken.addEventListener("click", () => copyText(elements.lanToken.textContent, "局域网访问令牌已复制。"));
+        }
 
         setIdleProgress();
     </script>

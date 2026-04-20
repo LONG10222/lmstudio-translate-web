@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>局域网访问令牌</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+</head>
+<body>
+    <div class="shell shell-narrow">
+        <section class="panel login-panel">
+            <p class="eyebrow">LAN Access</p>
+            <h1>输入局域网访问令牌</h1>
+            <p class="subtext">
+                你当前是通过局域网访问这台翻译服务器。为了防止同网段未授权访问，需要先输入访问令牌。
+            </p>
+            {% if error_message %}
+            <div class="message error">{{ error_message }}</div>
+            {% endif %}
+            <form class="login-form" method="post" action="{{ url_for('login') }}">
+                <label>
+                    <span>访问令牌</span>
+                    <input type="password" name="access_token" autocomplete="current-password" placeholder="请输入访问令牌">
+                </label>
+                <button class="primary" type="submit">进入翻译台</button>
+            </form>
+        </section>
+    </div>
+</body>
+</html>
