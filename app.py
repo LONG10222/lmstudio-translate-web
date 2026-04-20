@@ -7,6 +7,7 @@ import json
 import secrets
 import socket
 import ssl
+import threading
 import zipfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -45,6 +46,7 @@ SERVER_KEY_PATH = TLS_DIR / "lan-server.key"
 COOKIE_NAME = "lmstudio_translate_session"
 APP_HOST = "0.0.0.0"
 APP_PORT = 7870
+BOOTSTRAP_PORT = 7871
 PIN_TTL_MINUTES = 10
 TRUST_DEVICE_DAYS = 30
 TEMP_SESSION_HOURS = 12
@@ -434,6 +436,10 @@ def get_lan_urls() -> list[str]:
     return [f"https://{address}:{APP_PORT}/" for address in get_private_ipv4_addresses()]
 
 
+def get_bootstrap_urls() -> list[str]:
+    return [f"http://{address}:{BOOTSTRAP_PORT}/bootstrap" for address in get_private_ipv4_addresses()]
+
+
 def ensure_ca_certificate() -> tuple[rsa.RSAPrivateKey, x509.Certificate]:
     TLS_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -565,14 +571,28 @@ def format_thumbprint(hex_value: str) -> str:
     return ":".join(hex_value[i : i + 2] for i in range(0, len(hex_value), 2))
 
 
-def build_windows_onboarding_bundle(runtime: dict) -> bytes:
-    cert_bytes = CA_CERT_PATH.read_bytes()
-    lan_urls = runtime.get("lan_urls", [])
-    lan_url = lan_urls[0] if lan_urls else runtime["local_url"]
-    bundle_readme = f"""LM Studio Translate Web 局域网接入包
+def make_zip_info(filename: str, executable: bool = False) -> zipfile.ZipInfo:
+    info = zipfile.ZipInfo(filename)
+    info.compress_type = zipfile.ZIP_DEFLATED
+    if executable:
+        info.external_attr = 0o755 << 16
+    return info
 
-1. 先双击 Install-RootCA.ps1
-2. 按提示把根证书导入当前 Windows 用户的受信任根证书颁发机构
+
+def preferred_lan_url(runtime: dict) -> str:
+    lan_urls = runtime.get("lan_urls", [])
+    return lan_urls[0] if lan_urls else runtime["local_url"]
+
+
+def build_bundle_readme(platform_label: str, runtime: dict, install_file: str) -> str:
+    lan_url = preferred_lan_url(runtime)
+    return f"""LM Studio Translate Web 局域网接入包
+
+适用系统：
+{platform_label}
+
+1. 运行同目录下的 {install_file}
+2. 按提示把根证书导入当前系统信任区
 3. 导入完成后，在这台电脑打开：
    {lan_url}
 4. 首次登录时输入主机页面显示的 6 位 PIN
@@ -580,6 +600,12 @@ def build_windows_onboarding_bundle(runtime: dict) -> bytes:
 根证书 SHA-256 指纹：
 {runtime["ca_thumbprint_display"]}
 """
+
+
+def build_windows_onboarding_bundle(runtime: dict) -> bytes:
+    cert_bytes = CA_CERT_PATH.read_bytes()
+    lan_url = preferred_lan_url(runtime)
+    bundle_readme = build_bundle_readme("Windows", runtime, "Install-RootCA.ps1")
     install_script = f"""$ErrorActionPreference = "Stop"
 
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -601,10 +627,114 @@ Pause
 """
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-        archive.writestr("lmstudio-translate-root-ca.crt", cert_bytes)
-        archive.writestr("Install-RootCA.ps1", install_script.encode("utf-8"))
-        archive.writestr("README.txt", bundle_readme.encode("utf-8"))
+        archive.writestr(make_zip_info("lmstudio-translate-root-ca.crt"), cert_bytes)
+        archive.writestr(make_zip_info("Install-RootCA.ps1"), install_script.encode("utf-8"))
+        archive.writestr(make_zip_info("README.txt"), bundle_readme.encode("utf-8"))
     return buffer.getvalue()
+
+
+def build_macos_onboarding_bundle(runtime: dict) -> bytes:
+    cert_bytes = CA_CERT_PATH.read_bytes()
+    lan_url = preferred_lan_url(runtime)
+    bundle_readme = build_bundle_readme("macOS", runtime, "Install-RootCA.command")
+    install_script = f"""#!/bin/bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+CERT_PATH="$SCRIPT_DIR/lmstudio-translate-root-ca.crt"
+
+if [ ! -f "$CERT_PATH" ]; then
+  echo "Certificate file not found: $CERT_PATH"
+  exit 1
+fi
+
+sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain "$CERT_PATH"
+
+echo ""
+echo "根证书已导入系统钥匙串。"
+echo "下一步："
+echo "1. 打开 {lan_url}"
+echo "2. 输入主机页面显示的 6 位 PIN"
+echo ""
+read -r -p "按回车键继续..."
+"""
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr(make_zip_info("lmstudio-translate-root-ca.crt"), cert_bytes)
+        archive.writestr(make_zip_info("Install-RootCA.command", executable=True), install_script.encode("utf-8"))
+        archive.writestr(make_zip_info("README.txt"), bundle_readme.encode("utf-8"))
+    return buffer.getvalue()
+
+
+def build_linux_onboarding_bundle(runtime: dict) -> bytes:
+    cert_bytes = CA_CERT_PATH.read_bytes()
+    lan_url = preferred_lan_url(runtime)
+    bundle_readme = build_bundle_readme("Linux", runtime, "install-root-ca.sh")
+    install_script = f"""#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+CERT_PATH="$SCRIPT_DIR/lmstudio-translate-root-ca.crt"
+
+if [[ ! -f "$CERT_PATH" ]]; then
+  echo "Certificate file not found: $CERT_PATH"
+  exit 1
+fi
+
+if command -v update-ca-certificates >/dev/null 2>&1; then
+  sudo cp "$CERT_PATH" /usr/local/share/ca-certificates/lmstudio-translate-root-ca.crt
+  sudo update-ca-certificates
+elif command -v update-ca-trust >/dev/null 2>&1; then
+  sudo cp "$CERT_PATH" /etc/pki/ca-trust/source/anchors/lmstudio-translate-root-ca.crt
+  sudo update-ca-trust
+else
+  echo "未检测到常见证书更新命令。请手动把证书导入系统信任区。"
+fi
+
+echo ""
+echo "根证书导入流程已完成。"
+echo "下一步："
+echo "1. 打开 {lan_url}"
+echo "2. 输入主机页面显示的 6 位 PIN"
+echo ""
+read -r -p "按回车键继续..."
+"""
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr(make_zip_info("lmstudio-translate-root-ca.crt"), cert_bytes)
+        archive.writestr(make_zip_info("install-root-ca.sh", executable=True), install_script.encode("utf-8"))
+        archive.writestr(make_zip_info("README.txt"), bundle_readme.encode("utf-8"))
+    return buffer.getvalue()
+
+
+def detect_client_platform(user_agent: str | None) -> str:
+    ua = (user_agent or "").lower()
+    if "windows" in ua:
+        return "windows"
+    if "mac os x" in ua or "macintosh" in ua:
+        return "macos"
+    if "linux" in ua or "x11" in ua:
+        return "linux"
+    return "unknown"
+
+
+def platform_label(platform: str) -> str:
+    return {
+        "windows": "Windows",
+        "macos": "macOS",
+        "linux": "Linux",
+        "unknown": "未知系统",
+    }.get(platform, platform)
+
+
+def build_platform_onboarding_bundle(runtime: dict, platform: str) -> tuple[bytes, str]:
+    if platform == "windows":
+        return build_windows_onboarding_bundle(runtime), "lmstudio-lan-windows-bundle.zip"
+    if platform == "macos":
+        return build_macos_onboarding_bundle(runtime), "lmstudio-lan-macos-bundle.zip"
+    if platform == "linux":
+        return build_linux_onboarding_bundle(runtime), "lmstudio-lan-linux-bundle.zip"
+    return build_windows_onboarding_bundle(runtime), "lmstudio-lan-windows-bundle.zip"
 
 
 def prepare_runtime() -> dict:
@@ -617,6 +747,7 @@ def prepare_runtime() -> dict:
     return {
         "local_url": f"https://127.0.0.1:{APP_PORT}/",
         "lan_urls": get_lan_urls(),
+        "bootstrap_urls": get_bootstrap_urls(),
         "pairing_pin": pin,
         "pairing_pin_expires_at_display": format_display_time(pin_expires_at),
         "ca_cert_path": str(CA_CERT_PATH),
@@ -637,6 +768,17 @@ class QuietWSGIRequestHandler(WSGIRequestHandler):
         return
 
 
+def run_http_bootstrap_server() -> None:
+    with make_server(
+        APP_HOST,
+        BOOTSTRAP_PORT,
+        app,
+        server_class=ThreadedWSGIServer,
+        handler_class=QuietWSGIRequestHandler,
+    ) as server:
+        server.serve_forever()
+
+
 def run_https_server(runtime: dict) -> None:
     ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     ssl_context.load_cert_chain(
@@ -654,11 +796,28 @@ def run_https_server(runtime: dict) -> None:
         server.serve_forever()
 
 
+def get_request_port() -> int | None:
+    try:
+        return int(request.host.split(":")[-1])
+    except (ValueError, AttributeError):
+        return None
+
+
+def is_bootstrap_request() -> bool:
+    return not request.is_secure and get_request_port() == BOOTSTRAP_PORT
+
+
 @app.before_request
 def restrict_client_network():
     remote_ip = get_remote_ip()
     if not is_private_client(remote_ip):
         return make_response("只允许本机或局域网私有地址访问。", 403)
+
+    if is_bootstrap_request():
+        allowed_endpoints = {"bootstrap", "download_bundle", "download_public_ca_cert", "static"}
+        if request.endpoint not in allowed_endpoints:
+            return redirect(url_for("bootstrap"))
+        return None
 
     security = load_security_config()
     protected_endpoints = {"api_models", "api_translate"}
@@ -687,6 +846,9 @@ def apply_security_headers(response):
 
 @app.get("/")
 def index():
+    if is_bootstrap_request():
+        return redirect(url_for("bootstrap"))
+
     security = load_security_config()
     runtime = prepare_runtime()
     if not is_authorized_client(security):
@@ -707,6 +869,7 @@ def index():
         language_options=LANGUAGE_OPTIONS,
         initial_error=model_error or "",
         lan_urls=runtime["lan_urls"] if is_local_admin_request() else [],
+        bootstrap_urls=runtime["bootstrap_urls"] if is_local_admin_request() else [],
         pairing_pin=runtime["pairing_pin"] if is_local_admin_request() else "",
         pairing_pin_expires_at_display=runtime["pairing_pin_expires_at_display"] if is_local_admin_request() else "",
         ca_thumbprint_display=runtime["ca_thumbprint_display"] if is_local_admin_request() else "",
@@ -786,6 +949,47 @@ def download_windows_bundle():
     return response
 
 
+@app.get("/bootstrap")
+def bootstrap():
+    runtime = prepare_runtime()
+    detected_platform = detect_client_platform(request.headers.get("User-Agent"))
+    bundle_platform = detected_platform if detected_platform != "unknown" else "windows"
+    return render_template(
+        "bootstrap.html",
+        detected_platform=detected_platform,
+        detected_platform_label=platform_label(detected_platform),
+        bundle_platform=bundle_platform,
+        runtime=runtime,
+    )
+
+
+@app.get("/download/root-ca")
+def download_public_ca_cert():
+    prepare_runtime()
+    return send_file(
+        CA_CERT_PATH,
+        as_attachment=True,
+        download_name="lmstudio-translate-root-ca.crt",
+        mimetype="application/x-x509-ca-cert",
+    )
+
+
+@app.get("/download/bundle")
+def download_bundle():
+    runtime = prepare_runtime()
+    requested_platform = str(request.args.get("platform", "auto")).strip().lower()
+    if requested_platform == "auto":
+        requested_platform = detect_client_platform(request.headers.get("User-Agent"))
+    if requested_platform not in {"windows", "macos", "linux"}:
+        requested_platform = "windows"
+
+    bundle, filename = build_platform_onboarding_bundle(runtime, requested_platform)
+    response = make_response(bundle)
+    response.headers["Content-Type"] = "application/zip"
+    response.headers["Content-Disposition"] = f'attachment; filename="{filename}"'
+    return response
+
+
 @app.post("/api/models")
 def api_models():
     payload = request.get_json(silent=True) or {}
@@ -851,4 +1055,5 @@ def api_translate():
 
 if __name__ == "__main__":
     runtime = prepare_runtime()
+    threading.Thread(target=run_http_bootstrap_server, daemon=True).start()
     run_https_server(runtime)

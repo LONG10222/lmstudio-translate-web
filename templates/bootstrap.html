@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>局域网快速接入</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+</head>
+<body>
+    <div class="shell shell-narrow">
+        <section class="panel bootstrap-panel">
+            <p class="eyebrow">LAN Bootstrap</p>
+            <h1>局域网快速接入</h1>
+            <p class="subtext">
+                已检测到当前设备系统为 <strong>{{ detected_platform_label }}</strong>。
+                这一步只用于直接下载对应的一键接入包。导入根证书后，再打开 HTTPS 地址并输入主机页面显示的 6 位 PIN。
+            </p>
+
+            <div class="status-area">
+                <div class="lan-box">
+                    <span>快速下载</span>
+                    <p>优先点击“下载适配当前系统的一键接入包”。如果识别不准，也可以手动选择其他系统。</p>
+                    <div class="inline-actions">
+                        <a class="button-link primary" href="{{ url_for('download_bundle', platform='auto') }}">下载适配当前系统的一键接入包</a>
+                        <a class="button-link secondary" href="{{ url_for('download_public_ca_cert') }}">仅下载根证书</a>
+                    </div>
+                    <div class="inline-actions">
+                        <a class="button-link secondary compact" href="{{ url_for('download_bundle', platform='windows') }}">Windows 包</a>
+                        <a class="button-link secondary compact" href="{{ url_for('download_bundle', platform='macos') }}">macOS 包</a>
+                        <a class="button-link secondary compact" href="{{ url_for('download_bundle', platform='linux') }}">Linux 包</a>
+                    </div>
+                </div>
+
+                <div class="lan-box">
+                    <span>接入后打开</span>
+                    <ul>
+                        {% for lan_url in runtime.lan_urls %}
+                        <li><code>{{ lan_url }}</code></li>
+                        {% endfor %}
+                    </ul>
+                </div>
+
+                <div class="fingerprint-box">
+                    <span>安装前请核对根证书 SHA-256 指纹</span>
+                    <code>{{ runtime.ca_thumbprint_display }}</code>
+                    <small class="field-help">请和主机页面显示的指纹对照一致后再安装。这一步是为了避免 HTTP 快速接入页被中间人篡改。</small>
+                </div>
+
+                <div class="note-box">
+                    <strong>边界说明</strong>
+                    <p>浏览器网页不能直接把根证书静默装进 Windows、macOS 或 Linux 的系统信任区。这是操作系统和浏览器的安全边界。当前版本已经把流程压缩成：打开局域网页面，自动识别系统，直接下载对应导入包。</p>
+                </div>
+            </div>
+        </section>
+    </div>
+</body>
+</html>

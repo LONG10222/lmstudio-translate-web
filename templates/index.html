@@ -74,6 +74,17 @@
                             </ul>
                         </div>
                         {% endif %}
+                        {% if bootstrap_urls %}
+                        <div class="lan-box">
+                            <span>快速接入页</span>
+                            <p>其他电脑可以先打开下面任一 HTTP 地址。页面会自动识别系统，并直接提供对应的一键接入包下载。</p>
+                            <ul>
+                                {% for bootstrap_url in bootstrap_urls %}
+                                <li><code>{{ bootstrap_url }}</code></li>
+                                {% endfor %}
+                            </ul>
+                        </div>
+                        {% endif %}
                         <div class="os-help-grid">
                             <div class="os-card">
                                 <span>Windows</span>

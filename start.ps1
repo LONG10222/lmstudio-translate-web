@@ -41,10 +41,12 @@ if (-not $existingRoot -and (Test-Path $certPath)) {
     }
 }
 
-$existing = Get-NetTCPConnection -LocalPort 7870 -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1
-if ($existing) {
-    Stop-Process -Id $existing.OwningProcess -Force
-    Start-Sleep -Seconds 1
+foreach ($port in 7870, 7871) {
+    $existing = Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($existing) {
+        Stop-Process -Id $existing.OwningProcess -Force
+        Start-Sleep -Seconds 1
+    }
 }
 
 Start-Process -FilePath $venvPythonw -ArgumentList "app.py" -WorkingDirectory $projectRoot | Out-Null
