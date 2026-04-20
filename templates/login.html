@@ -3,24 +3,29 @@
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>局域网访问令牌</title>
+    <title>HTTPS 局域网接入</title>
     <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
 </head>
 <body>
     <div class="shell shell-narrow">
         <section class="panel login-panel">
             <p class="eyebrow">LAN Access</p>
-            <h1>输入局域网访问令牌</h1>
+            <h1>输入 6 位接入 PIN</h1>
             <p class="subtext">
-                你当前是通过局域网访问这台翻译服务器。为了防止同网段未授权访问，需要先输入访问令牌。
+                你当前是通过局域网访问这台翻译服务器。为了同时解决未授权访问、抓包泄露和中间人篡改，
+                需要先在这台设备上导入本机根证书，再通过 HTTPS 打开页面并输入 6 位 PIN。
             </p>
             {% if error_message %}
             <div class="message error">{{ error_message }}</div>
             {% endif %}
             <form class="login-form" method="post" action="{{ url_for('login') }}">
                 <label>
-                    <span>访问令牌</span>
-                    <input type="password" name="access_token" autocomplete="current-password" placeholder="请输入访问令牌">
+                    <span>6 位 PIN</span>
+                    <input type="password" inputmode="numeric" maxlength="6" name="pairing_pin" autocomplete="one-time-code" placeholder="请输入 6 位 PIN">
+                </label>
+                <label class="checkbox-row">
+                    <input type="checkbox" name="remember_device" value="1" checked>
+                    <span>信任这台设备 30 天</span>
                 </label>
                 <button class="primary" type="submit">进入翻译台</button>
             </form>

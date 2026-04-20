@@ -7,9 +7,7 @@
     --line: rgba(29, 36, 48, 0.12);
     --accent: #0b8b6d;
     --accent-strong: #0c6d56;
-    --accent-soft: #daf2ea;
     --warn: #d65d0e;
-    --warn-soft: #fff1e6;
     --danger: #a12f2f;
     --danger-bg: #f8e1e1;
     --ok-bg: #dff1e8;
@@ -91,30 +89,7 @@ h1 {
     line-height: 1.6;
 }
 
-.token-box {
-    margin-top: 14px;
-    padding: 14px;
-    background: rgba(255, 255, 255, 0.72);
-    border: 1px solid rgba(29, 36, 48, 0.08);
-    border-radius: 16px;
-    display: grid;
-    gap: 8px;
-}
-
-.token-box span {
-    font-size: 0.84rem;
-    font-weight: 700;
-    color: var(--muted);
-}
-
-.token-box code {
-    padding: 10px 12px;
-    background: #f5f1ea;
-    border-radius: 12px;
-    overflow-wrap: anywhere;
-    font-size: 0.92rem;
-}
-
+.token-box,
 .lan-box {
     margin-top: 14px;
     padding: 14px;
@@ -123,16 +98,30 @@ h1 {
     border-radius: 16px;
 }
 
+.token-box {
+    display: grid;
+    gap: 8px;
+}
+
+.token-box span,
 .lan-box span {
     display: block;
-    margin-bottom: 8px;
     font-size: 0.84rem;
     font-weight: 700;
     color: var(--muted);
 }
 
+.token-box code,
+.lan-box code {
+    padding: 10px 12px;
+    background: #f5f1ea;
+    border-radius: 12px;
+    overflow-wrap: anywhere;
+    font-size: 0.92rem;
+}
+
 .lan-box p {
-    margin: 0 0 10px;
+    margin: 8px 0 10px;
     color: var(--muted);
     line-height: 1.5;
 }
@@ -203,6 +192,27 @@ label span {
     grid-template-columns: minmax(0, 1fr) auto;
     gap: 10px;
     align-items: center;
+}
+
+.inline-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+}
+
+.checkbox-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+
+.checkbox-row input {
+    width: 18px;
+    height: 18px;
+}
+
+.checkbox-row span {
+    margin: 0;
 }
 
 input,
@@ -320,7 +330,8 @@ textarea {
     gap: 12px;
 }
 
-button {
+button,
+.button-link {
     width: auto;
     padding: 14px 20px;
     cursor: pointer;
@@ -328,7 +339,8 @@ button {
     transition: transform 0.18s ease, box-shadow 0.18s ease, opacity 0.18s ease;
 }
 
-button:hover {
+button:hover,
+.button-link:hover {
     transform: translateY(-1px);
 }
 
@@ -336,6 +348,13 @@ button:disabled {
     opacity: 0.68;
     cursor: wait;
     transform: none;
+}
+
+.button-link {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    text-decoration: none;
 }
 
 .primary {
@@ -368,7 +387,8 @@ button:disabled {
     .editor-head,
     .actions,
     .editor-tools,
-    .inline-row {
+    .inline-row,
+    .inline-actions {
         flex-direction: column;
         align-items: stretch;
     }
@@ -377,7 +397,8 @@ button:disabled {
         display: flex;
     }
 
-    button {
+    button,
+    .button-link {
         width: 100%;
     }
 }

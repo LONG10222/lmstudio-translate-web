@@ -1,23 +1,52 @@
 from __future__ import annotations
 
+import hashlib
 import ipaddress
 import json
 import secrets
 import socket
+import ssl
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from socketserver import ThreadingMixIn
 from urllib.parse import urlparse
+from wsgiref.simple_server import WSGIRequestHandler, WSGIServer, make_server
 
 import requests
-from flask import Flask, jsonify, make_response, redirect, render_template, request, url_for
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
+from flask import (
+    Flask,
+    jsonify,
+    make_response,
+    redirect,
+    render_template,
+    request,
+    send_file,
+    url_for,
+)
 from requests import exceptions as request_exceptions
 
 
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = BASE_DIR / "config.json"
 SECURITY_PATH = BASE_DIR / "security.json"
+RUNTIME_DIR = BASE_DIR / ".runtime"
+TLS_DIR = RUNTIME_DIR / "tls"
+CA_CERT_PATH = TLS_DIR / "lan-root-ca.crt"
+CA_KEY_PATH = TLS_DIR / "lan-root-ca.key"
+SERVER_CERT_PATH = TLS_DIR / "lan-server.crt"
+SERVER_KEY_PATH = TLS_DIR / "lan-server.key"
+
 COOKIE_NAME = "lmstudio_translate_session"
 APP_HOST = "0.0.0.0"
 APP_PORT = 7870
+PIN_TTL_MINUTES = 10
+TRUST_DEVICE_DAYS = 30
+TEMP_SESSION_HOURS = 12
+
 LM_STUDIO_BASE_URL_CANDIDATES = [
     "http://127.0.0.1:1234/v1",
     "http://localhost:1234/v1",
@@ -58,6 +87,29 @@ MODEL_PREFERENCES = [
 app = Flask(__name__, template_folder="templates", static_folder="static")
 
 
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def datetime_to_storage(value: datetime | None) -> str | None:
+    return value.isoformat() if value else None
+
+
+def datetime_from_storage(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    parsed = datetime.fromisoformat(value)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def format_display_time(value: datetime | None) -> str:
+    if value is None:
+        return ""
+    return value.astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+
+
 def load_config() -> dict:
     config = DEFAULT_CONFIG.copy()
     if CONFIG_PATH.exists():
@@ -73,15 +125,26 @@ def save_config(config: dict) -> None:
 
 
 def load_security_config() -> dict:
+    security = {
+        "pairing_pin": None,
+        "pairing_pin_expires_at": None,
+        "device_sessions": [],
+    }
     if SECURITY_PATH.exists():
         with open(SECURITY_PATH, "r", encoding="utf-8") as file:
-            security = json.load(file)
-    else:
-        security = {}
+            persisted = json.load(file)
+        security.update(persisted)
 
-    if not security.get("lan_access_token"):
-        security["lan_access_token"] = secrets.token_urlsafe(24)
-        save_security_config(security)
+    security["device_sessions"] = [
+        session
+        for session in security.get("device_sessions", [])
+        if datetime_from_storage(session.get("expires_at")) and datetime_from_storage(session.get("expires_at")) > utc_now()
+    ]
+
+    pin_expires_at = datetime_from_storage(security.get("pairing_pin_expires_at"))
+    if pin_expires_at is None or pin_expires_at <= utc_now():
+        security["pairing_pin"] = None
+        security["pairing_pin_expires_at"] = None
 
     return security
 
@@ -89,6 +152,64 @@ def load_security_config() -> dict:
 def save_security_config(security: dict) -> None:
     with open(SECURITY_PATH, "w", encoding="utf-8") as file:
         json.dump(security, file, ensure_ascii=False, indent=2)
+
+
+def hash_token(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def issue_pairing_pin(security: dict) -> tuple[str, datetime]:
+    pin = f"{secrets.randbelow(1_000_000):06d}"
+    expires_at = utc_now() + timedelta(minutes=PIN_TTL_MINUTES)
+    security["pairing_pin"] = pin
+    security["pairing_pin_expires_at"] = datetime_to_storage(expires_at)
+    save_security_config(security)
+    return pin, expires_at
+
+
+def ensure_active_pairing_pin(security: dict) -> tuple[str, datetime]:
+    pin = security.get("pairing_pin")
+    expires_at = datetime_from_storage(security.get("pairing_pin_expires_at"))
+    if not pin or expires_at is None or expires_at <= utc_now():
+        return issue_pairing_pin(security)
+    return pin, expires_at
+
+
+def verify_pairing_pin(security: dict, pin: str) -> bool:
+    stored_pin = security.get("pairing_pin")
+    expires_at = datetime_from_storage(security.get("pairing_pin_expires_at"))
+    if not stored_pin or expires_at is None or expires_at <= utc_now():
+        return False
+    return secrets.compare_digest(stored_pin, pin)
+
+
+def create_device_session(security: dict, remember_device: bool) -> tuple[str, datetime]:
+    raw_token = secrets.token_urlsafe(32)
+    expires_at = utc_now() + (
+        timedelta(days=TRUST_DEVICE_DAYS)
+        if remember_device
+        else timedelta(hours=TEMP_SESSION_HOURS)
+    )
+    security.setdefault("device_sessions", []).append(
+        {
+            "token_hash": hash_token(raw_token),
+            "expires_at": datetime_to_storage(expires_at),
+        }
+    )
+    save_security_config(security)
+    return raw_token, expires_at
+
+
+def remove_device_session(security: dict, raw_token: str | None) -> None:
+    if not raw_token:
+        return
+    token_hash = hash_token(raw_token)
+    security["device_sessions"] = [
+        session
+        for session in security.get("device_sessions", [])
+        if session.get("token_hash") != token_hash
+    ]
+    save_security_config(security)
 
 
 def normalize_base_url(base_url: str) -> str:
@@ -101,7 +222,6 @@ def ensure_local_base_url(base_url: str) -> str:
         raise ValueError("未找到可用的本机 LM Studio 地址。")
 
     parsed = urlparse(normalized)
-
     if parsed.scheme not in {"http", "https"}:
         raise ValueError("接口地址只允许 http 或 https。")
     if not parsed.hostname:
@@ -271,33 +391,221 @@ def is_private_client(ip: ipaddress._BaseAddress | None) -> bool:
     return ip.is_loopback or ip.is_private
 
 
+def is_local_admin_request() -> bool:
+    remote_ip = get_remote_ip()
+    return bool(remote_ip and remote_ip.is_loopback)
+
+
 def is_authorized_client(security: dict) -> bool:
-    remote_ip = get_remote_ip()
-    if remote_ip and remote_ip.is_loopback:
+    if is_local_admin_request():
         return True
-    return request.cookies.get(COOKIE_NAME) == security["lan_access_token"]
+
+    raw_token = request.cookies.get(COOKIE_NAME)
+    if not raw_token:
+        return False
+
+    token_hash = hash_token(raw_token)
+    for session in security.get("device_sessions", []):
+        expires_at = datetime_from_storage(session.get("expires_at"))
+        if expires_at and expires_at > utc_now() and secrets.compare_digest(session.get("token_hash", ""), token_hash):
+            return True
+    return False
 
 
-def is_admin_view(security: dict) -> bool:
-    remote_ip = get_remote_ip()
-    return bool(remote_ip and remote_ip.is_loopback and is_authorized_client(security))
+def get_private_ipv4_addresses() -> list[ipaddress.IPv4Address]:
+    addresses: set[ipaddress.IPv4Address] = set()
+    hostnames = {socket.gethostname(), socket.getfqdn(), "localhost"}
+    for hostname in hostnames:
+        try:
+            for result in socket.getaddrinfo(hostname, None, family=socket.AF_INET):
+                address = ipaddress.ip_address(result[4][0])
+                if isinstance(address, ipaddress.IPv4Address) and address.is_private and not address.is_loopback:
+                    addresses.add(address)
+        except OSError:
+            continue
+    return sorted(addresses)
 
 
 def get_lan_urls() -> list[str]:
-    urls: set[str] = set()
-    hostnames = {socket.gethostname(), socket.getfqdn(), "localhost"}
+    return [f"https://{address}:{APP_PORT}/" for address in get_private_ipv4_addresses()]
 
-    for hostname in hostnames:
-        try:
-            for result in socket.getaddrinfo(hostname, APP_PORT, family=socket.AF_INET):
-                address = result[4][0]
-                ip = ipaddress.ip_address(address)
-                if ip.is_private and not ip.is_loopback:
-                    urls.add(f"http://{address}:{APP_PORT}/")
-        except OSError:
-            continue
 
-    return sorted(urls)
+def ensure_ca_certificate() -> tuple[rsa.RSAPrivateKey, x509.Certificate]:
+    TLS_DIR.mkdir(parents=True, exist_ok=True)
+
+    if CA_CERT_PATH.exists() and CA_KEY_PATH.exists():
+        ca_cert = x509.load_pem_x509_certificate(CA_CERT_PATH.read_bytes())
+        ca_key = serialization.load_pem_private_key(CA_KEY_PATH.read_bytes(), password=None)
+        return ca_key, ca_cert
+
+    ca_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    subject = x509.Name(
+        [
+            x509.NameAttribute(NameOID.COUNTRY_NAME, "CN"),
+            x509.NameAttribute(NameOID.ORGANIZATION_NAME, "LM Studio Translate Web"),
+            x509.NameAttribute(NameOID.COMMON_NAME, "LM Studio Translate Local Root CA"),
+        ]
+    )
+    now = utc_now()
+    ca_cert = (
+        x509.CertificateBuilder()
+        .subject_name(subject)
+        .issuer_name(subject)
+        .public_key(ca_key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - timedelta(days=1))
+        .not_valid_after(now + timedelta(days=3650))
+        .add_extension(x509.BasicConstraints(ca=True, path_length=0), critical=True)
+        .add_extension(
+            x509.KeyUsage(
+                digital_signature=True,
+                key_encipherment=False,
+                content_commitment=False,
+                data_encipherment=False,
+                key_agreement=False,
+                key_cert_sign=True,
+                crl_sign=True,
+                encipher_only=False,
+                decipher_only=False,
+            ),
+            critical=True,
+        )
+        .sign(ca_key, hashes.SHA256())
+    )
+
+    CA_CERT_PATH.write_bytes(ca_cert.public_bytes(serialization.Encoding.PEM))
+    CA_KEY_PATH.write_bytes(
+        ca_key.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.PKCS8,
+            encryption_algorithm=serialization.NoEncryption(),
+        )
+    )
+    return ca_key, ca_cert
+
+
+def build_server_sans() -> list[x509.GeneralName]:
+    sans: list[x509.GeneralName] = [
+        x509.DNSName("localhost"),
+        x509.IPAddress(ipaddress.ip_address("127.0.0.1")),
+        x509.IPAddress(ipaddress.ip_address("::1")),
+    ]
+
+    dns_seen = {"localhost"}
+    for hostname in (socket.gethostname(), socket.getfqdn()):
+        if hostname and hostname not in dns_seen:
+            dns_seen.add(hostname)
+            sans.append(x509.DNSName(hostname))
+
+    for address in get_private_ipv4_addresses():
+        sans.append(x509.IPAddress(address))
+
+    return sans
+
+
+def ensure_server_certificate(ca_key: rsa.RSAPrivateKey, ca_cert: x509.Certificate) -> None:
+    server_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    now = utc_now()
+    subject = x509.Name(
+        [
+            x509.NameAttribute(NameOID.ORGANIZATION_NAME, "LM Studio Translate Web"),
+            x509.NameAttribute(NameOID.COMMON_NAME, "LM Studio Translate HTTPS Server"),
+        ]
+    )
+    server_cert = (
+        x509.CertificateBuilder()
+        .subject_name(subject)
+        .issuer_name(ca_cert.subject)
+        .public_key(server_key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - timedelta(days=1))
+        .not_valid_after(now + timedelta(days=365))
+        .add_extension(x509.SubjectAlternativeName(build_server_sans()), critical=False)
+        .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+        .add_extension(
+            x509.ExtendedKeyUsage([ExtendedKeyUsageOID.SERVER_AUTH]),
+            critical=False,
+        )
+        .add_extension(
+            x509.KeyUsage(
+                digital_signature=True,
+                key_encipherment=True,
+                content_commitment=False,
+                data_encipherment=False,
+                key_agreement=False,
+                key_cert_sign=False,
+                crl_sign=False,
+                encipher_only=False,
+                decipher_only=False,
+            ),
+            critical=True,
+        )
+        .sign(ca_key, hashes.SHA256())
+    )
+
+    SERVER_CERT_PATH.write_bytes(server_cert.public_bytes(serialization.Encoding.PEM))
+    SERVER_KEY_PATH.write_bytes(
+        server_key.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.PKCS8,
+            encryption_algorithm=serialization.NoEncryption(),
+        )
+    )
+
+
+def certificate_thumbprint(certificate: x509.Certificate) -> str:
+    return certificate.fingerprint(hashes.SHA256()).hex().upper()
+
+
+def format_thumbprint(hex_value: str) -> str:
+    return ":".join(hex_value[i : i + 2] for i in range(0, len(hex_value), 2))
+
+
+def prepare_runtime() -> dict:
+    security = load_security_config()
+    pin, pin_expires_at = ensure_active_pairing_pin(security)
+    ca_key, ca_cert = ensure_ca_certificate()
+    ensure_server_certificate(ca_key, ca_cert)
+    thumbprint = certificate_thumbprint(ca_cert)
+
+    return {
+        "local_url": f"https://127.0.0.1:{APP_PORT}/",
+        "lan_urls": get_lan_urls(),
+        "pairing_pin": pin,
+        "pairing_pin_expires_at_display": format_display_time(pin_expires_at),
+        "ca_cert_path": str(CA_CERT_PATH),
+        "ca_thumbprint": thumbprint,
+        "ca_thumbprint_display": format_thumbprint(thumbprint),
+        "server_cert_path": str(SERVER_CERT_PATH),
+        "server_key_path": str(SERVER_KEY_PATH),
+    }
+
+
+class ThreadedWSGIServer(ThreadingMixIn, WSGIServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+
+class QuietWSGIRequestHandler(WSGIRequestHandler):
+    def log_message(self, format: str, *args) -> None:
+        return
+
+
+def run_https_server(runtime: dict) -> None:
+    ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ssl_context.load_cert_chain(
+        certfile=runtime["server_cert_path"],
+        keyfile=runtime["server_key_path"],
+    )
+    with make_server(
+        APP_HOST,
+        APP_PORT,
+        app,
+        server_class=ThreadedWSGIServer,
+        handler_class=QuietWSGIRequestHandler,
+    ) as server:
+        server.socket = ssl_context.wrap_socket(server.socket, server_side=True)
+        server.serve_forever()
 
 
 @app.before_request
@@ -307,8 +615,9 @@ def restrict_client_network():
         return make_response("只允许本机或局域网私有地址访问。", 403)
 
     security = load_security_config()
-    if request.endpoint and request.endpoint.startswith("api_") and not is_authorized_client(security):
-        return jsonify({"ok": False, "error": "未授权。请先在局域网访问页输入访问令牌。"}), 403
+    protected_endpoints = {"api_models", "api_translate"}
+    if request.endpoint in protected_endpoints and not is_authorized_client(security):
+        return jsonify({"ok": False, "error": "未授权。请先输入 6 位 PIN。"}), 403
 
 
 @app.after_request
@@ -333,6 +642,7 @@ def apply_security_headers(response):
 @app.get("/")
 def index():
     security = load_security_config()
+    runtime = prepare_runtime()
     if not is_authorized_client(security):
         return render_template("login.html", error_message="")
 
@@ -350,35 +660,71 @@ def index():
         models=models,
         language_options=LANGUAGE_OPTIONS,
         initial_error=model_error or "",
-        lan_access_token=security["lan_access_token"] if is_admin_view(security) else "",
-        lan_urls=get_lan_urls() if is_admin_view(security) else [],
+        lan_urls=runtime["lan_urls"] if is_local_admin_request() else [],
+        pairing_pin=runtime["pairing_pin"] if is_local_admin_request() else "",
+        pairing_pin_expires_at_display=runtime["pairing_pin_expires_at_display"] if is_local_admin_request() else "",
+        ca_thumbprint_display=runtime["ca_thumbprint_display"] if is_local_admin_request() else "",
     )
 
 
 @app.post("/login")
 def login():
     security = load_security_config()
-    token = request.form.get("access_token", "").strip()
-    if token != security["lan_access_token"]:
-        return render_template("login.html", error_message="访问令牌错误。"), 403
+    pin = request.form.get("pairing_pin", "").strip()
+    remember_device = request.form.get("remember_device") == "1"
+    if not verify_pairing_pin(security, pin):
+        return render_template("login.html", error_message="PIN 错误或已过期。"), 403
 
+    device_token, expires_at = create_device_session(security, remember_device)
     response = make_response(redirect(url_for("index")))
     response.set_cookie(
         COOKIE_NAME,
-        token,
-        max_age=12 * 60 * 60,
+        device_token,
+        max_age=int((expires_at - utc_now()).total_seconds()),
         httponly=True,
         samesite="Strict",
-        secure=request.is_secure,
+        secure=True,
     )
     return response
 
 
 @app.post("/logout")
 def logout():
+    security = load_security_config()
+    remove_device_session(security, request.cookies.get(COOKIE_NAME))
     response = make_response(redirect(url_for("index")))
     response.delete_cookie(COOKIE_NAME)
     return response
+
+
+@app.post("/admin/pin/regenerate")
+def regenerate_pin():
+    if not is_local_admin_request():
+        return jsonify({"ok": False, "error": "只有本机管理员可以重新生成 PIN。"}), 403
+
+    security = load_security_config()
+    pin, expires_at = issue_pairing_pin(security)
+    return jsonify(
+        {
+            "ok": True,
+            "pairing_pin": pin,
+            "pairing_pin_expires_at_display": format_display_time(expires_at),
+            "message": "已生成新的 6 位 PIN。",
+        }
+    )
+
+
+@app.get("/admin/ca-cert")
+def download_ca_cert():
+    if not is_local_admin_request():
+        return make_response("只允许在本机下载根证书。", 403)
+    prepare_runtime()
+    return send_file(
+        CA_CERT_PATH,
+        as_attachment=True,
+        download_name="lmstudio-translate-root-ca.crt",
+        mimetype="application/x-x509-ca-cert",
+    )
 
 
 @app.post("/api/models")
@@ -445,5 +791,5 @@ def api_translate():
 
 
 if __name__ == "__main__":
-    load_security_config()
-    app.run(host=APP_HOST, port=APP_PORT, debug=False)
+    runtime = prepare_runtime()
+    run_https_server(runtime)

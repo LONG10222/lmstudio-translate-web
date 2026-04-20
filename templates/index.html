@@ -13,24 +13,36 @@
                 <p class="eyebrow">Local LLM Translation</p>
                 <h1>LM Studio 本地翻译台</h1>
                 <p class="subtext">
-                    页面现在可以通过局域网访问，但后端仍然只允许连接本机 LM Studio 回环地址。
-                    同时启用局域网访问令牌、Strict Cookie 和无代理出站，尽量降低未授权访问与内容被转发的风险。
+                    页面现在通过 HTTPS 提供局域网访问，后端仍然只允许连接本机 LM Studio 回环地址。
+                    本机管理员可以发放 6 位 PIN，其他设备导入根证书后即可安全接入，并通过受信设备会话长期使用。
                 </p>
             </div>
             <div class="privacy-card">
                 <strong>隐私约束</strong>
                 <p>翻译请求只会从网页发到这台电脑，再由这台电脑发给本机 `LM Studio`。后端会拒绝公网、域名和局域网形式的 LM Studio 地址。</p>
-                {% if lan_access_token %}
+                {% if pairing_pin %}
                 <div class="token-box">
-                    <span>局域网访问令牌</span>
-                    <code id="lan_access_token">{{ lan_access_token }}</code>
-                    <button class="secondary compact" type="button" id="copy_token">复制令牌</button>
+                    <span>6 位接入 PIN</span>
+                    <code id="pairing_pin">{{ pairing_pin }}</code>
+                    <div class="inline-actions">
+                        <button class="secondary compact" type="button" id="copy_pin">复制 PIN</button>
+                        <button class="secondary compact" type="button" id="refresh_pin">重新生成 PIN</button>
+                    </div>
+                    <small id="pairing_pin_expires" class="field-help">有效期至：{{ pairing_pin_expires_at_display }}</small>
+                </div>
+                <div class="lan-box">
+                    <span>HTTPS 接入准备</span>
+                    <p>先在其他电脑导入本机根证书，再访问下面任一 HTTPS 地址，首次登录只需输入上面的 6 位 PIN。</p>
+                    <div class="inline-actions">
+                        <a class="button-link secondary compact" href="{{ url_for('download_ca_cert') }}">下载根证书</a>
+                    </div>
+                    <small class="field-help">根证书 SHA-256 指纹：{{ ca_thumbprint_display }}</small>
                 </div>
                 {% endif %}
                 {% if lan_urls %}
                 <div class="lan-box">
                     <span>局域网接入方式</span>
-                    <p>局域网内其他设备先打开下面任一地址，再输入上面的访问令牌：</p>
+                    <p>局域网内其他设备导入根证书后，打开下面任一地址，再输入上面的 6 位 PIN：</p>
                     <ul>
                         {% for lan_url in lan_urls %}
                         <li><code>{{ lan_url }}</code></li>
@@ -146,7 +158,7 @@
 
                     <div class="actions">
                         <form method="post" action="{{ url_for('logout') }}">
-                            <button class="secondary" type="submit">退出局域网会话</button>
+                            <button class="secondary" type="submit">退出当前设备会话</button>
                         </form>
                         <button class="secondary" type="button" id="clear_all">清空</button>
                         <button class="primary" type="button" id="translate_button">开始翻译</button>
@@ -178,8 +190,10 @@
             copySource: document.getElementById("copy_source"),
             copyTarget: document.getElementById("copy_target"),
             clearAll: document.getElementById("clear_all"),
-            copyToken: document.getElementById("copy_token"),
-            lanToken: document.getElementById("lan_access_token"),
+            copyPin: document.getElementById("copy_pin"),
+            refreshPin: document.getElementById("refresh_pin"),
+            pairingPin: document.getElementById("pairing_pin"),
+            pairingPinExpires: document.getElementById("pairing_pin_expires"),
         };
 
         let progressTimer = null;
@@ -247,6 +261,18 @@
                     "Content-Type": "application/json",
                 },
                 body: JSON.stringify(payload),
+                credentials: "same-origin",
+            });
+            const data = await response.json();
+            if (!response.ok || !data.ok) {
+                throw new Error(data.error || "请求失败。");
+            }
+            return data;
+        }
+
+        async function postAdmin(url) {
+            const response = await fetch(url, {
+                method: "POST",
                 credentials: "same-origin",
             });
             const data = await response.json();
@@ -356,6 +382,21 @@
             setMessage("已清空原文和译文。", "success");
         }
 
+        async function regeneratePin() {
+            try {
+                const data = await postAdmin("/admin/pin/regenerate");
+                if (elements.pairingPin) {
+                    elements.pairingPin.textContent = data.pairing_pin;
+                }
+                if (elements.pairingPinExpires) {
+                    elements.pairingPinExpires.textContent = `有效期至：${data.pairing_pin_expires_at_display}`;
+                }
+                setMessage(data.message, "success");
+            } catch (error) {
+                setMessage(error.message, "error");
+            }
+        }
+
         elements.modelSelect.addEventListener("change", syncModelInputFromSelect);
         elements.refreshModels.addEventListener("click", handleRefreshModels);
         elements.translateButton.addEventListener("click", handleTranslate);
@@ -363,8 +404,11 @@
         elements.copySource.addEventListener("click", () => copyText(elements.sourceText.value, "原文已复制。"));
         elements.copyTarget.addEventListener("click", () => copyText(elements.translatedText.value, "译文已复制。"));
         elements.clearAll.addEventListener("click", clearEditors);
-        if (elements.copyToken && elements.lanToken) {
-            elements.copyToken.addEventListener("click", () => copyText(elements.lanToken.textContent, "局域网访问令牌已复制。"));
+        if (elements.copyPin && elements.pairingPin) {
+            elements.copyPin.addEventListener("click", () => copyText(elements.pairingPin.textContent, "6 位 PIN 已复制。"));
+        }
+        if (elements.refreshPin) {
+            elements.refreshPin.addEventListener("click", regeneratePin);
         }
 
         setIdleProgress();
