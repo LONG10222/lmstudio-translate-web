@@ -71,6 +71,8 @@ h1 {
 }
 
 .privacy-card {
+    position: relative;
+    overflow: visible;
     padding: 18px 20px;
     background: var(--panel-strong);
     border: 1px solid rgba(214, 93, 14, 0.18);
@@ -135,18 +137,22 @@ h1 {
 
 .access-details {
     margin-top: 14px;
-    padding: 12px 14px;
-    background: rgba(255, 255, 255, 0.62);
-    border: 1px solid rgba(29, 36, 48, 0.08);
-    border-radius: 16px;
+    position: relative;
 }
 
 .access-details summary {
+    display: inline-flex;
+    align-items: center;
     cursor: pointer;
     list-style: none;
     font-size: 0.94rem;
     font-weight: 700;
     color: var(--accent-strong);
+    padding: 12px 14px;
+    background: rgba(255, 255, 255, 0.72);
+    border: 1px solid rgba(29, 36, 48, 0.08);
+    border-radius: 14px;
+    box-shadow: 0 10px 24px rgba(25, 31, 45, 0.08);
 }
 
 .access-details summary::-webkit-details-marker {
@@ -165,9 +171,23 @@ h1 {
 }
 
 .access-details-body {
-    display: grid;
+    display: none;
+    position: absolute;
+    top: calc(100% + 12px);
+    right: 0;
+    width: min(760px, 78vw);
     gap: 14px;
-    margin-top: 14px;
+    padding: 16px;
+    background: rgba(255, 248, 238, 0.98);
+    border: 1px solid rgba(29, 36, 48, 0.08);
+    border-radius: 20px;
+    box-shadow: 0 24px 60px rgba(25, 31, 45, 0.18);
+    z-index: 50;
+    backdrop-filter: blur(14px);
+}
+
+.access-details[open] .access-details-body {
+    display: grid;
 }
 
 .access-grid {
@@ -592,6 +612,13 @@ button:disabled {
 
     .access-pill-group {
         justify-content: flex-start;
+    }
+
+    .access-details-body {
+        position: static;
+        width: auto;
+        margin-top: 14px;
+        box-shadow: none;
     }
 }
 
