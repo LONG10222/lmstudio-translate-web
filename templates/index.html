@@ -27,6 +27,17 @@
                     <button class="secondary compact" type="button" id="copy_token">复制令牌</button>
                 </div>
                 {% endif %}
+                {% if lan_urls %}
+                <div class="lan-box">
+                    <span>局域网接入方式</span>
+                    <p>局域网内其他设备先打开下面任一地址，再输入上面的访问令牌：</p>
+                    <ul>
+                        {% for lan_url in lan_urls %}
+                        <li><code>{{ lan_url }}</code></li>
+                        {% endfor %}
+                    </ul>
+                </div>
+                {% endif %}
             </div>
         </header>
 

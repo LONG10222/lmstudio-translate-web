@@ -3,6 +3,7 @@ from __future__ import annotations
 import ipaddress
 import json
 import secrets
+import socket
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -282,6 +283,23 @@ def is_admin_view(security: dict) -> bool:
     return bool(remote_ip and remote_ip.is_loopback and is_authorized_client(security))
 
 
+def get_lan_urls() -> list[str]:
+    urls: set[str] = set()
+    hostnames = {socket.gethostname(), socket.getfqdn(), "localhost"}
+
+    for hostname in hostnames:
+        try:
+            for result in socket.getaddrinfo(hostname, APP_PORT, family=socket.AF_INET):
+                address = result[4][0]
+                ip = ipaddress.ip_address(address)
+                if ip.is_private and not ip.is_loopback:
+                    urls.add(f"http://{address}:{APP_PORT}/")
+        except OSError:
+            continue
+
+    return sorted(urls)
+
+
 @app.before_request
 def restrict_client_network():
     remote_ip = get_remote_ip()
@@ -333,6 +351,7 @@ def index():
         language_options=LANGUAGE_OPTIONS,
         initial_error=model_error or "",
         lan_access_token=security["lan_access_token"] if is_admin_view(security) else "",
+        lan_urls=get_lan_urls() if is_admin_view(security) else [],
     )
 
 
