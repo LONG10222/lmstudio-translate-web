@@ -271,8 +271,10 @@ def resolve_lmstudio_base_url(config: dict) -> tuple[str | None, list[str], str 
             candidates.append(ensure_local_base_url(configured_base_url))
         except Exception as exc:
             return None, [], format_request_error(exc, "读取模型列表")
-    else:
-        candidates.extend(LM_STUDIO_BASE_URL_CANDIDATES)
+
+    for candidate in LM_STUDIO_BASE_URL_CANDIDATES:
+        if candidate not in candidates:
+            candidates.append(candidate)
 
     last_exc: Exception | None = None
     for candidate in candidates:
