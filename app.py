@@ -109,6 +109,41 @@ SYSTEM_SNAPSHOT_LOCK = threading.Lock()
 SYSTEM_SNAPSHOT_CACHE = {"captured_at": 0.0, "snapshot": None}
 
 
+class TranslationQueue:
+    def __init__(self) -> None:
+        self._condition = threading.Condition()
+        self._next_ticket = 0
+        self._serving_ticket = 0
+        self._active = False
+
+    def acquire(self) -> dict:
+        with self._condition:
+            ticket = self._next_ticket
+            self._next_ticket += 1
+            queued_ahead = max(0, ticket - self._serving_ticket)
+            wait_started_at = time.perf_counter()
+
+            while ticket != self._serving_ticket or self._active:
+                self._condition.wait()
+
+            wait_ms = round((time.perf_counter() - wait_started_at) * 1000, 1)
+            self._active = True
+            return {
+                "ticket": ticket,
+                "queued_ahead": queued_ahead,
+                "wait_ms": wait_ms,
+            }
+
+    def release(self) -> None:
+        with self._condition:
+            self._active = False
+            self._serving_ticket += 1
+            self._condition.notify_all()
+
+
+TRANSLATION_QUEUE = TranslationQueue()
+
+
 def utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -1702,19 +1737,27 @@ def api_translate():
         return jsonify({"ok": False, "error": "请先选择或手动填写模型名。"}), 400
 
     save_config(config)
+    queue_state = TRANSLATION_QUEUE.acquire()
     plan = build_translation_plan(config, source_text)
     started_at = time.perf_counter()
 
     try:
         translated_text, chunk_count = translate_text(config, plan, config["base_url"], source_text)
     except Exception as exc:
+        TRANSLATION_QUEUE.release()
         return jsonify({"ok": False, "error": format_request_error(exc, "翻译")}), 400
 
+    TRANSLATION_QUEUE.release()
     elapsed_ms = round((time.perf_counter() - started_at) * 1000, 1)
 
     message = "翻译完成。"
     if chunk_count > 1:
         message = f"长文本已自动分段翻译，共 {chunk_count} 段。"
+    if queue_state["queued_ahead"] > 0 or queue_state["wait_ms"] >= 200:
+        message += (
+            f" 提交时前面有 {queue_state['queued_ahead']} 个任务，"
+            f"等待 {round(queue_state['wait_ms'] / 1000, 2)} 秒后开始。"
+        )
 
     return jsonify(
         {
@@ -1736,6 +1779,9 @@ def api_translate():
             "auto_tokens_enabled": plan["auto_tokens_enabled"],
             "gpu": gpu_snapshot_response(plan["gpu_snapshot"]),
             "system": system_snapshot_response(plan["memory_snapshot"]),
+            "queue_wait_ms": queue_state["wait_ms"],
+            "queue_wait_seconds": round(queue_state["wait_ms"] / 1000, 2),
+            "queue_position_at_submit": queue_state["queued_ahead"] + 1,
         }
     )
 
