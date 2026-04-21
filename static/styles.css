@@ -265,6 +265,32 @@ h1 {
     font-size: 0.92rem;
 }
 
+.mobile-entry-box {
+    display: grid;
+    gap: 12px;
+}
+
+.mobile-entry-grid {
+    display: grid;
+    grid-template-columns: 140px minmax(0, 1fr);
+    gap: 14px;
+    align-items: center;
+}
+
+.mobile-entry-grid img {
+    width: 140px;
+    height: 140px;
+    padding: 8px;
+    border-radius: 18px;
+    background: white;
+    border: 1px solid rgba(29, 36, 48, 0.08);
+}
+
+.mobile-entry-copy {
+    display: grid;
+    gap: 8px;
+}
+
 .lan-box p {
     margin: 8px 0 10px;
     color: var(--muted);
@@ -543,6 +569,37 @@ textarea {
     background: linear-gradient(90deg, #cb3f3f 0%, #a12f2f 100%);
 }
 
+.runtime-metrics {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 12px;
+}
+
+.metric-card {
+    padding: 14px 16px;
+    border-radius: 18px;
+    background: rgba(255, 255, 255, 0.78);
+    border: 1px solid var(--line);
+    display: grid;
+    gap: 6px;
+}
+
+.metric-card span {
+    color: var(--muted);
+    font-size: 0.82rem;
+    font-weight: 700;
+}
+
+.metric-card strong {
+    color: var(--ink);
+    font-size: 1rem;
+    line-height: 1.35;
+}
+
+.metric-card-wide {
+    grid-column: 1 / -1;
+}
+
 .actions {
     display: flex;
     justify-content: flex-end;
@@ -608,6 +665,14 @@ button:disabled {
     .access-summary-row {
         align-items: stretch;
         flex-direction: column;
+    }
+
+    .runtime-metrics {
+        grid-template-columns: 1fr;
+    }
+
+    .mobile-entry-grid {
+        grid-template-columns: 1fr;
     }
 
     .access-pill-group {

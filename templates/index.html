@@ -67,22 +67,49 @@
                         <div class="lan-box">
                             <span>局域网地址</span>
                             <p>其他设备在信任根证书后，打开下面任一 HTTPS 地址，再输入上面的 6 位 PIN。</p>
-                            <ul>
+                            <ul id="lan_url_list">
                                 {% for lan_url in lan_urls %}
                                 <li><code>{{ lan_url }}</code></li>
                                 {% endfor %}
                             </ul>
+                            {% if hostname_urls %}
+                            <small class="field-help">如果手机或其他电脑能解析主机名，也可以尝试下面这些稳定地址：</small>
+                            <ul id="hostname_url_list">
+                                {% for hostname_url in hostname_urls %}
+                                <li><code>{{ hostname_url }}</code></li>
+                                {% endfor %}
+                            </ul>
+                            {% endif %}
                         </div>
                         {% endif %}
                         {% if bootstrap_urls %}
                         <div class="lan-box">
                             <span>快速接入页</span>
                             <p>其他电脑可以先打开下面任一 HTTP 地址。页面会自动识别系统，并直接提供对应的一键接入包下载。</p>
-                            <ul>
+                            <ul id="bootstrap_url_list">
                                 {% for bootstrap_url in bootstrap_urls %}
                                 <li><code>{{ bootstrap_url }}</code></li>
                                 {% endfor %}
                             </ul>
+                            {% if hostname_bootstrap_urls %}
+                            <small class="field-help">如果局域网 DNS 可用，换 Wi-Fi 后也可以优先试这些主机名入口：</small>
+                            <ul id="hostname_bootstrap_url_list">
+                                {% for hostname_bootstrap_url in hostname_bootstrap_urls %}
+                                <li><code>{{ hostname_bootstrap_url }}</code></li>
+                                {% endfor %}
+                            </ul>
+                            {% endif %}
+                        </div>
+                        <div class="lan-box mobile-entry-box">
+                            <span>手机接入</span>
+                            <p>手机直接扫描下面的二维码即可打开当前局域网快速接入页。页面会自动识别 iPhone / Android，并给出对应证书导入方式。</p>
+                            <div class="mobile-entry-grid">
+                                <img id="mobile_bootstrap_qr" src="{{ mobile_bootstrap_qr_data_uri }}" alt="手机快速接入二维码">
+                                <div class="mobile-entry-copy">
+                                    <code id="preferred_bootstrap_url">{{ preferred_bootstrap_url }}</code>
+                                    <small class="field-help">如果切换了 Wi-Fi，本机页面会自动刷新这里的地址和二维码。</small>
+                                </div>
+                            </div>
                         </div>
                         {% endif %}
                         <div class="os-help-grid">
@@ -195,6 +222,20 @@
                                 <div id="progress_bar" class="progress-bar"></div>
                             </div>
                         </div>
+                        <div id="runtime_metrics" class="runtime-metrics hidden">
+                            <div class="metric-card">
+                                <span>&#26412;&#22320;&#32791;&#26102;</span>
+                                <strong id="elapsed_time">-</strong>
+                            </div>
+                            <div class="metric-card">
+                                <span>&#23454;&#38469; Tokens</span>
+                                <strong id="effective_tokens">-</strong>
+                            </div>
+                            <div class="metric-card metric-card-wide">
+                                <span>&#30828;&#20214;&#35843;&#20248;</span>
+                                <strong id="tuning_summary">&#26410;&#35835;&#21462;</strong>
+                            </div>
+                        </div>
                     </div>
 
                     <div class="editor-grid">
@@ -248,6 +289,10 @@
             progressLabel: document.getElementById("progress_label"),
             progressPercent: document.getElementById("progress_percent"),
             progressBar: document.getElementById("progress_bar"),
+            runtimeMetrics: document.getElementById("runtime_metrics"),
+            elapsedTime: document.getElementById("elapsed_time"),
+            effectiveTokens: document.getElementById("effective_tokens"),
+            tuningSummary: document.getElementById("tuning_summary"),
             translateButton: document.getElementById("translate_button"),
             refreshModels: document.getElementById("refresh_models"),
             pasteSource: document.getElementById("paste_source"),
@@ -260,6 +305,12 @@
             pairingPinExpires: document.getElementById("pairing_pin_expires"),
             caThumbprint: document.getElementById("ca_thumbprint"),
             copyThumbprint: document.getElementById("copy_thumbprint"),
+            lanUrlList: document.getElementById("lan_url_list"),
+            hostnameUrlList: document.getElementById("hostname_url_list"),
+            bootstrapUrlList: document.getElementById("bootstrap_url_list"),
+            hostnameBootstrapUrlList: document.getElementById("hostname_bootstrap_url_list"),
+            preferredBootstrapUrl: document.getElementById("preferred_bootstrap_url"),
+            mobileBootstrapQr: document.getElementById("mobile_bootstrap_qr"),
         };
 
         let progressTimer = null;
@@ -292,6 +343,22 @@
             elements.progressPercent.textContent = "0%";
             elements.progressBar.style.width = "0%";
             elements.progressBar.classList.remove("is-error");
+        }
+
+        function resetRuntimeMetrics() {
+            elements.runtimeMetrics.classList.add("hidden");
+            elements.elapsedTime.textContent = "-";
+            elements.effectiveTokens.textContent = "-";
+            elements.tuningSummary.textContent = "\u672a\u8bfb\u53d6";
+        }
+
+        function updateRuntimeMetrics(data) {
+            elements.runtimeMetrics.classList.remove("hidden");
+            elements.elapsedTime.textContent = `${data.elapsed_seconds ?? 0}s / ${data.elapsed_ms ?? 0} ms`;
+            elements.effectiveTokens.textContent = data.auto_tokens_enabled
+                ? `${data.effective_max_tokens} / ${data.configured_max_tokens} · ${data.chunk_char_limit}字/段`
+                : `${data.effective_max_tokens} · ${data.chunk_char_limit}字/段`;
+            elements.tuningSummary.textContent = data.tuning_summary || "\u672a\u8bfb\u53d6";
         }
 
         function startProgress() {
@@ -348,6 +415,58 @@
             return data;
         }
 
+        async function getJson(url) {
+            const response = await fetch(url, {
+                method: "GET",
+                credentials: "same-origin",
+                cache: "no-store",
+            });
+            const data = await response.json();
+            if (!response.ok || !data.ok) {
+                throw new Error(data.error || "请求失败。");
+            }
+            return data;
+        }
+
+        function renderUrlList(target, values) {
+            if (!target) {
+                return;
+            }
+            target.innerHTML = "";
+            for (const value of values || []) {
+                const item = document.createElement("li");
+                const code = document.createElement("code");
+                code.textContent = value;
+                item.appendChild(code);
+                target.appendChild(item);
+            }
+        }
+
+        function applyRuntimeAccessInfo(data) {
+            renderUrlList(elements.lanUrlList, data.lan_urls);
+            renderUrlList(elements.hostnameUrlList, data.hostname_urls);
+            renderUrlList(elements.bootstrapUrlList, data.bootstrap_urls);
+            renderUrlList(elements.hostnameBootstrapUrlList, data.hostname_bootstrap_urls);
+            if (elements.preferredBootstrapUrl) {
+                elements.preferredBootstrapUrl.textContent = data.preferred_bootstrap_url || "";
+            }
+            if (elements.mobileBootstrapQr && data.mobile_bootstrap_qr_data_uri) {
+                elements.mobileBootstrapQr.src = data.mobile_bootstrap_qr_data_uri;
+            }
+        }
+
+        async function refreshAccessRuntime() {
+            if (!elements.copyPin) {
+                return;
+            }
+            try {
+                const data = await getJson("/admin/runtime");
+                applyRuntimeAccessInfo(data);
+            } catch (error) {
+                console.error(error);
+            }
+        }
+
         function syncModelInputFromSelect() {
             if (elements.modelSelect.value) {
                 elements.modelName.value = elements.modelSelect.value;
@@ -396,6 +515,7 @@
 
             elements.translateButton.disabled = true;
             startProgress();
+            resetRuntimeMetrics();
 
             try {
                 const data = await postJson("/api/translate", payloadFromForm());
@@ -406,6 +526,7 @@
                 if (data.base_url) {
                     elements.baseUrl.value = data.base_url;
                 }
+                updateRuntimeMetrics(data);
                 finishProgress(true);
                 setMessage(data.message, "success");
             } catch (error) {
@@ -445,6 +566,7 @@
             elements.sourceText.value = "";
             elements.translatedText.value = "";
             setIdleProgress();
+            resetRuntimeMetrics();
             setMessage("已清空原文和译文。", "success");
         }
 
@@ -481,6 +603,11 @@
         }
 
         setIdleProgress();
+        resetRuntimeMetrics();
+        if (elements.copyPin) {
+            refreshAccessRuntime();
+            window.setInterval(refreshAccessRuntime, 15000);
+        }
     </script>
 </body>
 </html>

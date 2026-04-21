@@ -1,15 +1,19 @@
 from __future__ import annotations
 
+import ctypes
 import hashlib
 import ipaddress
 import io
 import json
 import math
+import os
 import secrets
 import re
 import socket
 import ssl
+import subprocess
 import threading
+import time
 import zipfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -17,6 +21,8 @@ from socketserver import ThreadingMixIn
 from urllib.parse import urlparse
 from wsgiref.simple_server import WSGIRequestHandler, WSGIServer, make_server
 
+import qrcode
+import qrcode.image.svg
 import requests
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
@@ -52,10 +58,12 @@ BOOTSTRAP_PORT = 7871
 PIN_TTL_MINUTES = 10
 TRUST_DEVICE_DAYS = 30
 TEMP_SESSION_HOURS = 12
-MIN_TRANSLATION_MAX_TOKENS = 512
+MIN_TRANSLATION_MAX_TOKENS = 256
 MAX_TRANSLATION_MAX_TOKENS = 4096
 MIN_CHUNK_CHARS = 700
 MAX_CHUNK_CHARS = 3200
+GPU_SNAPSHOT_TTL_SECONDS = 2.0
+SYSTEM_SNAPSHOT_TTL_SECONDS = 2.0
 
 LM_STUDIO_BASE_URL_CANDIDATES = [
     "http://127.0.0.1:1234/v1",
@@ -95,6 +103,10 @@ MODEL_PREFERENCES = [
 ]
 
 app = Flask(__name__, template_folder="templates", static_folder="static")
+GPU_SNAPSHOT_LOCK = threading.Lock()
+GPU_SNAPSHOT_CACHE = {"captured_at": 0.0, "snapshot": None}
+SYSTEM_SNAPSHOT_LOCK = threading.Lock()
+SYSTEM_SNAPSHOT_CACHE = {"captured_at": 0.0, "snapshot": None}
 
 
 def utc_now() -> datetime:
@@ -345,19 +357,424 @@ def build_messages(text: str, source_lang: str, target_lang: str) -> list[dict]:
     return [{"role": "user", "content": user_prompt}]
 
 
-def estimate_chunk_char_limit(config: dict) -> int:
-    configured_tokens = int(config.get("max_tokens", DEFAULT_CONFIG["max_tokens"]))
-    estimated_chars = configured_tokens * 4
-    return max(MIN_CHUNK_CHARS, min(MAX_CHUNK_CHARS, estimated_chars))
+def clamp_int(value: int, lower: int, upper: int) -> int:
+    return max(lower, min(upper, value))
 
 
-def estimate_completion_tokens(config: dict, text: str) -> int:
-    configured_tokens = int(config.get("max_tokens", DEFAULT_CONFIG["max_tokens"]))
-    estimated_tokens = math.ceil(len(text) / 3)
-    return max(
-        configured_tokens,
-        min(MAX_TRANSLATION_MAX_TOKENS, max(MIN_TRANSLATION_MAX_TOKENS, estimated_tokens)),
+class MEMORYSTATUSEX(ctypes.Structure):
+    _fields_ = [
+        ("dwLength", ctypes.c_ulong),
+        ("dwMemoryLoad", ctypes.c_ulong),
+        ("ullTotalPhys", ctypes.c_ulonglong),
+        ("ullAvailPhys", ctypes.c_ulonglong),
+        ("ullTotalPageFile", ctypes.c_ulonglong),
+        ("ullAvailPageFile", ctypes.c_ulonglong),
+        ("ullTotalVirtual", ctypes.c_ulonglong),
+        ("ullAvailVirtual", ctypes.c_ulonglong),
+        ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+    ]
+
+
+def read_gpu_memory_snapshot(force: bool = False) -> dict:
+    now = time.monotonic()
+    with GPU_SNAPSHOT_LOCK:
+        cached = GPU_SNAPSHOT_CACHE.get("snapshot")
+        if (
+            not force
+            and cached is not None
+            and now - float(GPU_SNAPSHOT_CACHE.get("captured_at", 0.0)) < GPU_SNAPSHOT_TTL_SECONDS
+        ):
+            return cached
+
+    snapshot = {
+        "available": False,
+        "name": "",
+        "free_mb": None,
+        "total_mb": None,
+        "free_ratio": None,
+        "gpu_count": 0,
+        "reason": "unavailable",
+    }
+
+    try:
+        result = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=name,memory.free,memory.total",
+                "--format=csv,noheader,nounits",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=True,
+        )
+        gpus: list[dict] = []
+        for raw_line in result.stdout.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            parts = [part.strip() for part in line.split(",")]
+            if len(parts) != 3:
+                continue
+            try:
+                free_mb = int(parts[1])
+                total_mb = int(parts[2])
+            except ValueError:
+                continue
+            gpus.append(
+                {
+                    "name": parts[0],
+                    "free_mb": free_mb,
+                    "total_mb": total_mb,
+                    "free_ratio": (free_mb / total_mb) if total_mb else 0.0,
+                }
+            )
+
+        if gpus:
+            best_gpu = max(gpus, key=lambda item: (item["free_mb"], item["total_mb"]))
+            snapshot = {
+                "available": True,
+                "name": best_gpu["name"],
+                "free_mb": best_gpu["free_mb"],
+                "total_mb": best_gpu["total_mb"],
+                "free_ratio": best_gpu["free_ratio"],
+                "gpu_count": len(gpus),
+                "reason": "",
+            }
+        else:
+            snapshot["reason"] = "no-gpu-data"
+    except FileNotFoundError:
+        snapshot["reason"] = "nvidia-smi-not-found"
+    except subprocess.TimeoutExpired:
+        snapshot["reason"] = "nvidia-smi-timeout"
+    except subprocess.CalledProcessError:
+        snapshot["reason"] = "nvidia-smi-error"
+
+    with GPU_SNAPSHOT_LOCK:
+        GPU_SNAPSHOT_CACHE["captured_at"] = now
+        GPU_SNAPSHOT_CACHE["snapshot"] = snapshot
+    return snapshot
+
+
+def read_system_memory_snapshot(force: bool = False) -> dict:
+    now = time.monotonic()
+    with SYSTEM_SNAPSHOT_LOCK:
+        cached = SYSTEM_SNAPSHOT_CACHE.get("snapshot")
+        if (
+            not force
+            and cached is not None
+            and now - float(SYSTEM_SNAPSHOT_CACHE.get("captured_at", 0.0)) < SYSTEM_SNAPSHOT_TTL_SECONDS
+        ):
+            return cached
+
+    snapshot = {
+        "available": False,
+        "total_mb": None,
+        "free_mb": None,
+        "free_ratio": None,
+        "logical_cores": max(1, os.cpu_count() or 1),
+        "reason": "unavailable",
+    }
+
+    try:
+        if os.name == "nt":
+            memory_status = MEMORYSTATUSEX()
+            memory_status.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+            if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(memory_status)):
+                raise OSError("GlobalMemoryStatusEx failed")
+            total_bytes = int(memory_status.ullTotalPhys)
+            free_bytes = int(memory_status.ullAvailPhys)
+        else:
+            page_size = int(os.sysconf("SC_PAGE_SIZE"))
+            total_pages = int(os.sysconf("SC_PHYS_PAGES"))
+            free_pages = int(os.sysconf("SC_AVPHYS_PAGES"))
+            total_bytes = page_size * total_pages
+            free_bytes = page_size * free_pages
+
+        total_mb = max(1, total_bytes // (1024 * 1024))
+        free_mb = max(0, free_bytes // (1024 * 1024))
+        snapshot = {
+            "available": True,
+            "total_mb": total_mb,
+            "free_mb": free_mb,
+            "free_ratio": (free_mb / total_mb) if total_mb else 0.0,
+            "logical_cores": max(1, os.cpu_count() or 1),
+            "reason": "",
+        }
+    except (AttributeError, OSError, ValueError):
+        snapshot["reason"] = "memory-query-failed"
+
+    with SYSTEM_SNAPSHOT_LOCK:
+        SYSTEM_SNAPSHOT_CACHE["captured_at"] = now
+        SYSTEM_SNAPSHOT_CACHE["snapshot"] = snapshot
+    return snapshot
+
+
+def estimate_gpu_token_ceiling(snapshot: dict) -> int | None:
+    if not snapshot.get("available"):
+        return None
+
+    free_mb = int(snapshot["free_mb"])
+    free_ratio = float(snapshot["free_ratio"])
+
+    if free_mb >= 16_384:
+        ceiling = 4096
+    elif free_mb >= 12_288:
+        ceiling = 3072
+    elif free_mb >= 8_192:
+        ceiling = 2048
+    elif free_mb >= 6_144:
+        ceiling = 1536
+    elif free_mb >= 4_096:
+        ceiling = 1024
+    elif free_mb >= 3_072:
+        ceiling = 768
+    elif free_mb >= 2_048:
+        ceiling = 512
+    else:
+        ceiling = 256
+
+    if free_ratio < 0.12:
+        ceiling = min(ceiling, 512)
+    elif free_ratio < 0.2:
+        ceiling = min(ceiling, 768)
+
+    return clamp_int(ceiling, MIN_TRANSLATION_MAX_TOKENS, MAX_TRANSLATION_MAX_TOKENS)
+
+
+def estimate_memory_token_ceiling(snapshot: dict) -> int:
+    if not snapshot.get("available"):
+        return 1024
+
+    free_mb = int(snapshot["free_mb"])
+    free_ratio = float(snapshot["free_ratio"])
+
+    if free_mb >= 24_576:
+        ceiling = 4096
+    elif free_mb >= 16_384:
+        ceiling = 3072
+    elif free_mb >= 12_288:
+        ceiling = 2048
+    elif free_mb >= 8_192:
+        ceiling = 1536
+    elif free_mb >= 6_144:
+        ceiling = 1024
+    elif free_mb >= 4_096:
+        ceiling = 768
+    else:
+        ceiling = 512
+
+    if free_ratio < 0.12:
+        ceiling = min(ceiling, 512)
+    elif free_ratio < 0.18:
+        ceiling = min(ceiling, 768)
+
+    return clamp_int(ceiling, MIN_TRANSLATION_MAX_TOKENS, MAX_TRANSLATION_MAX_TOKENS)
+
+
+def estimate_cpu_token_ceiling(snapshot: dict) -> int:
+    logical_cores = int(snapshot.get("logical_cores") or 1)
+    if logical_cores >= 24:
+        ceiling = 3072
+    elif logical_cores >= 16:
+        ceiling = 2048
+    elif logical_cores >= 12:
+        ceiling = 1536
+    elif logical_cores >= 8:
+        ceiling = 1024
+    elif logical_cores >= 4:
+        ceiling = 768
+    else:
+        ceiling = 512
+    return clamp_int(ceiling, MIN_TRANSLATION_MAX_TOKENS, MAX_TRANSLATION_MAX_TOKENS)
+
+
+def classify_hardware_tier(
+    gpu_snapshot: dict,
+    memory_snapshot: dict,
+    cpu_token_ceiling: int,
+    memory_token_ceiling: int,
+) -> str:
+    gpu_ceiling = estimate_gpu_token_ceiling(gpu_snapshot) if gpu_snapshot.get("available") else None
+    if gpu_ceiling is not None and gpu_ceiling >= 2048 and memory_token_ceiling >= 2048 and cpu_token_ceiling >= 1536:
+        return "high"
+    if gpu_ceiling is not None and gpu_ceiling >= 1024 and memory_token_ceiling >= 1024 and cpu_token_ceiling >= 1024:
+        return "balanced"
+    if memory_token_ceiling >= 1536 and cpu_token_ceiling >= 1024:
+        return "balanced"
+    return "constrained"
+
+
+def build_translation_plan(config: dict, source_text: str) -> dict:
+    configured_tokens = clamp_int(
+        int(config.get("max_tokens", DEFAULT_CONFIG["max_tokens"])),
+        64,
+        8192,
     )
+    gpu_snapshot = read_gpu_memory_snapshot()
+    memory_snapshot = read_system_memory_snapshot()
+    gpu_token_ceiling = estimate_gpu_token_ceiling(gpu_snapshot)
+    memory_token_ceiling = estimate_memory_token_ceiling(memory_snapshot)
+    cpu_token_ceiling = estimate_cpu_token_ceiling(memory_snapshot)
+    hardware_tier = classify_hardware_tier(
+        gpu_snapshot,
+        memory_snapshot,
+        cpu_token_ceiling,
+        memory_token_ceiling,
+    )
+
+    effective_max_tokens = configured_tokens
+    token_ceilings = [memory_token_ceiling, cpu_token_ceiling]
+    if gpu_token_ceiling is not None:
+        token_ceilings.append(gpu_token_ceiling)
+    auto_tokens_enabled = True
+    effective_max_tokens = min([configured_tokens, *token_ceilings])
+
+    text_length = len(source_text.strip())
+    if hardware_tier == "constrained" and text_length > 12_000:
+        effective_max_tokens = min(effective_max_tokens, 768)
+    elif hardware_tier == "balanced" and text_length > 18_000:
+        effective_max_tokens = min(effective_max_tokens, 1536)
+    elif text_length < 800 and hardware_tier == "high":
+        effective_max_tokens = min(configured_tokens, max(768, effective_max_tokens))
+
+    effective_max_tokens = clamp_int(
+        effective_max_tokens,
+        MIN_TRANSLATION_MAX_TOKENS,
+        MAX_TRANSLATION_MAX_TOKENS,
+    )
+    base_chunk_limit = effective_max_tokens * 4
+    if hardware_tier == "high":
+        chunk_upper = MAX_CHUNK_CHARS
+    elif hardware_tier == "balanced":
+        chunk_upper = 2600
+    else:
+        chunk_upper = 1800
+    chunk_char_limit = max(MIN_CHUNK_CHARS, min(chunk_upper, base_chunk_limit))
+    estimated_chunk_count = max(1, math.ceil(max(1, text_length) / chunk_char_limit))
+    effective_timeout = clamp_int(
+        max(
+            int(config.get("request_timeout", DEFAULT_CONFIG["request_timeout"])),
+            45 + estimated_chunk_count * (10 if hardware_tier == "constrained" else 6),
+        ),
+        45,
+        300,
+    )
+    tuning_summary = build_tuning_summary(
+        gpu_snapshot,
+        memory_snapshot,
+        hardware_tier,
+        effective_max_tokens,
+        chunk_char_limit,
+    )
+
+    return {
+        "configured_max_tokens": configured_tokens,
+        "effective_max_tokens": effective_max_tokens,
+        "chunk_char_limit": chunk_char_limit,
+        "auto_tokens_enabled": auto_tokens_enabled,
+        "effective_timeout": effective_timeout,
+        "gpu_snapshot": gpu_snapshot,
+        "memory_snapshot": memory_snapshot,
+        "gpu_token_ceiling": gpu_token_ceiling,
+        "memory_token_ceiling": memory_token_ceiling,
+        "cpu_token_ceiling": cpu_token_ceiling,
+        "hardware_tier": hardware_tier,
+        "estimated_chunk_count": estimated_chunk_count,
+        "tuning_summary": tuning_summary,
+    }
+
+
+def estimate_chunk_char_limit(plan: dict) -> int:
+    return int(plan["chunk_char_limit"])
+
+
+def build_tuning_summary(
+    gpu_snapshot: dict,
+    memory_snapshot: dict,
+    hardware_tier: str,
+    effective_max_tokens: int,
+    chunk_char_limit: int,
+) -> str:
+    tier_label = {
+        "high": "高性能",
+        "balanced": "均衡",
+        "constrained": "保守",
+    }.get(hardware_tier, "均衡")
+
+    parts = [tier_label]
+    if gpu_snapshot.get("available"):
+        parts.append(
+            f"GPU {gpu_snapshot['free_mb'] / 1024:.1f}/{gpu_snapshot['total_mb'] / 1024:.1f} GiB"
+        )
+    if memory_snapshot.get("available"):
+        parts.append(
+            f"RAM {memory_snapshot['free_mb'] / 1024:.1f}/{memory_snapshot['total_mb'] / 1024:.1f} GiB"
+        )
+    parts.append(f"CPU {int(memory_snapshot.get('logical_cores') or 1)} 线程")
+    parts.append(f"Tokens {effective_max_tokens}")
+    parts.append(f"分段 {chunk_char_limit} 字")
+    return " · ".join(parts)
+
+
+def estimate_completion_tokens(plan: dict, text: str) -> int:
+    estimated_tokens = math.ceil(len(text) / 3)
+    return clamp_int(
+        min(int(plan["effective_max_tokens"]), max(MIN_TRANSLATION_MAX_TOKENS, estimated_tokens)),
+        MIN_TRANSLATION_MAX_TOKENS,
+        MAX_TRANSLATION_MAX_TOKENS,
+    )
+
+
+def gpu_snapshot_response(snapshot: dict) -> dict:
+    if not snapshot.get("available"):
+        return {
+            "available": False,
+            "name": "",
+            "free_mb": None,
+            "total_mb": None,
+            "free_gib": "",
+            "total_gib": "",
+            "summary": "未读取到可用显存，沿用手动 Tokens。",
+        }
+
+    free_mb = int(snapshot["free_mb"])
+    total_mb = int(snapshot["total_mb"])
+    return {
+        "available": True,
+        "name": snapshot["name"],
+        "free_mb": free_mb,
+        "total_mb": total_mb,
+        "free_gib": f"{free_mb / 1024:.1f} GiB",
+        "total_gib": f"{total_mb / 1024:.1f} GiB",
+        "summary": f"{snapshot['name']} · 剩余 {free_mb / 1024:.1f} / {total_mb / 1024:.1f} GiB",
+    }
+
+
+def system_snapshot_response(snapshot: dict) -> dict:
+    if not snapshot.get("available"):
+        return {
+            "available": False,
+            "free_mb": None,
+            "total_mb": None,
+            "free_gib": "",
+            "total_gib": "",
+            "logical_cores": int(snapshot.get("logical_cores") or 1),
+            "summary": "未读取到系统内存，按保守策略执行。",
+        }
+
+    free_mb = int(snapshot["free_mb"])
+    total_mb = int(snapshot["total_mb"])
+    logical_cores = int(snapshot.get("logical_cores") or 1)
+    return {
+        "available": True,
+        "free_mb": free_mb,
+        "total_mb": total_mb,
+        "free_gib": f"{free_mb / 1024:.1f} GiB",
+        "total_gib": f"{total_mb / 1024:.1f} GiB",
+        "logical_cores": logical_cores,
+        "summary": f"RAM 剩余 {free_mb / 1024:.1f} / {total_mb / 1024:.1f} GiB · CPU {logical_cores} 线程",
+    }
 
 
 def split_text_for_translation(text: str, max_chars: int) -> list[str]:
@@ -401,8 +818,8 @@ def split_text_for_translation(text: str, max_chars: int) -> list[str]:
     return chunks
 
 
-def request_translation(config: dict, base_url: str, text: str) -> str:
-    max_tokens = estimate_completion_tokens(config, text)
+def request_translation(config: dict, plan: dict, base_url: str, text: str) -> str:
+    max_tokens = estimate_completion_tokens(plan, text)
     with make_session() as session:
         response = session.post(
             f"{base_url}/chat/completions",
@@ -418,7 +835,7 @@ def request_translation(config: dict, base_url: str, text: str) -> str:
                 "temperature": config["temperature"],
                 "max_tokens": max_tokens,
             },
-            timeout=int(config["request_timeout"]),
+            timeout=int(plan["effective_timeout"]),
         )
     response.raise_for_status()
     payload = response.json()
@@ -428,12 +845,12 @@ def request_translation(config: dict, base_url: str, text: str) -> str:
     return translated
 
 
-def translate_text(config: dict, base_url: str, text: str) -> tuple[str, int]:
-    chunks = split_text_for_translation(text, estimate_chunk_char_limit(config))
+def translate_text(config: dict, plan: dict, base_url: str, text: str) -> tuple[str, int]:
+    chunks = split_text_for_translation(text, estimate_chunk_char_limit(plan))
     if not chunks:
         return "", 0
 
-    translated_chunks = [request_translation(config, base_url, chunk) for chunk in chunks]
+    translated_chunks = [request_translation(config, plan, base_url, chunk) for chunk in chunks]
     joiner = "\n\n" if len(translated_chunks) > 1 else ""
     return joiner.join(translated_chunks), len(translated_chunks)
 
@@ -509,12 +926,33 @@ def get_private_ipv4_addresses() -> list[ipaddress.IPv4Address]:
     return sorted(addresses)
 
 
+def get_lan_hostnames() -> list[str]:
+    hostnames: list[str] = []
+    seen: set[str] = set()
+    for hostname in (socket.gethostname(), socket.getfqdn()):
+        normalized = (hostname or "").strip().strip(".")
+        if not normalized or normalized.lower() == "localhost":
+            continue
+        if normalized.lower() not in seen:
+            seen.add(normalized.lower())
+            hostnames.append(normalized)
+    return hostnames
+
+
 def get_lan_urls() -> list[str]:
     return [f"https://{address}:{APP_PORT}/" for address in get_private_ipv4_addresses()]
 
 
+def get_hostname_urls() -> list[str]:
+    return [f"https://{hostname}:{APP_PORT}/" for hostname in get_lan_hostnames()]
+
+
 def get_bootstrap_urls() -> list[str]:
     return [f"http://{address}:{BOOTSTRAP_PORT}/bootstrap" for address in get_private_ipv4_addresses()]
+
+
+def get_hostname_bootstrap_urls() -> list[str]:
+    return [f"http://{hostname}:{BOOTSTRAP_PORT}/bootstrap" for hostname in get_lan_hostnames()]
 
 
 def ensure_ca_certificate() -> tuple[rsa.RSAPrivateKey, x509.Certificate]:
@@ -590,7 +1028,37 @@ def build_server_sans() -> list[x509.GeneralName]:
     return sans
 
 
+def current_server_san_values() -> tuple[set[str], set[str]]:
+    dns_values: set[str] = set()
+    ip_values: set[str] = set()
+    for san in build_server_sans():
+        if isinstance(san, x509.DNSName):
+            dns_values.add(san.value.lower())
+        elif isinstance(san, x509.IPAddress):
+            ip_values.add(str(san.value))
+    return dns_values, ip_values
+
+
+def server_certificate_matches_current_network() -> bool:
+    if not SERVER_CERT_PATH.exists() or not SERVER_KEY_PATH.exists():
+        return False
+
+    try:
+        server_cert = x509.load_pem_x509_certificate(SERVER_CERT_PATH.read_bytes())
+        san_extension = server_cert.extensions.get_extension_for_class(x509.SubjectAlternativeName)
+    except (ValueError, x509.ExtensionNotFound):
+        return False
+
+    existing_dns = {value.lower() for value in san_extension.value.get_values_for_type(x509.DNSName)}
+    existing_ips = {str(value) for value in san_extension.value.get_values_for_type(x509.IPAddress)}
+    expected_dns, expected_ips = current_server_san_values()
+    return expected_dns == existing_dns and expected_ips == existing_ips
+
+
 def ensure_server_certificate(ca_key: rsa.RSAPrivateKey, ca_cert: x509.Certificate) -> None:
+    if server_certificate_matches_current_network():
+        return
+
     server_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     now = utc_now()
     subject = x509.Name(
@@ -784,8 +1252,75 @@ read -r -p "按回车键继续..."
     return buffer.getvalue()
 
 
+def build_qr_svg_data_uri(value: str) -> str:
+    qr = qrcode.QRCode(border=1, box_size=8)
+    qr.add_data(value)
+    qr.make(fit=True)
+    image = qr.make_image(image_factory=qrcode.image.svg.SvgPathImage)
+    buffer = io.BytesIO()
+    image.save(buffer)
+    svg = buffer.getvalue().decode("utf-8").replace("#", "%23").replace("\n", "")
+    return f"data:image/svg+xml;utf8,{svg}"
+
+
+def build_apple_mobileconfig(runtime: dict) -> bytes:
+    cert_text = CA_CERT_PATH.read_text(encoding="utf-8")
+    cert_b64 = (
+        cert_text.replace("-----BEGIN CERTIFICATE-----", "")
+        .replace("-----END CERTIFICATE-----", "")
+        .replace("\n", "")
+        .strip()
+    )
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>PayloadContent</key>
+  <array>
+    <dict>
+      <key>PayloadCertificateFileName</key>
+      <string>lmstudio-translate-root-ca.crt</string>
+      <key>PayloadContent</key>
+      <data>{cert_b64}</data>
+      <key>PayloadDescription</key>
+      <string>Install LM Studio Translate Root CA</string>
+      <key>PayloadDisplayName</key>
+      <string>LM Studio Translate Root CA</string>
+      <key>PayloadIdentifier</key>
+      <string>local.lmstudio.translate.rootca.cert</string>
+      <key>PayloadType</key>
+      <string>com.apple.security.root</string>
+      <key>PayloadUUID</key>
+      <string>{secrets.token_hex(16)}</string>
+      <key>PayloadVersion</key>
+      <integer>1</integer>
+    </dict>
+  </array>
+  <key>PayloadDescription</key>
+  <string>Install LM Studio Translate Root CA for iPhone and iPad access.</string>
+  <key>PayloadDisplayName</key>
+  <string>LM Studio Translate Mobile Access</string>
+  <key>PayloadIdentifier</key>
+  <string>local.lmstudio.translate.mobile</string>
+  <key>PayloadRemovalDisallowed</key>
+  <false/>
+  <key>PayloadType</key>
+  <string>Configuration</string>
+  <key>PayloadUUID</key>
+  <string>{secrets.token_hex(16)}</string>
+  <key>PayloadVersion</key>
+  <integer>1</integer>
+</dict>
+</plist>
+""".encode("utf-8")
+
+
 def detect_client_platform(user_agent: str | None) -> str:
     ua = (user_agent or "").lower()
+    if "iphone" in ua or "ipad" in ua or "ipod" in ua:
+        return "ios"
+    if "android" in ua:
+        return "android"
     if "windows" in ua:
         return "windows"
     if "mac os x" in ua or "macintosh" in ua:
@@ -797,6 +1332,8 @@ def detect_client_platform(user_agent: str | None) -> str:
 
 def platform_label(platform: str) -> str:
     return {
+        "ios": "iPhone / iPad",
+        "android": "Android",
         "windows": "Windows",
         "macos": "macOS",
         "linux": "Linux",
@@ -811,6 +1348,10 @@ def build_platform_onboarding_bundle(runtime: dict, platform: str) -> tuple[byte
         return build_macos_onboarding_bundle(runtime), "lmstudio-lan-macos-bundle.zip"
     if platform == "linux":
         return build_linux_onboarding_bundle(runtime), "lmstudio-lan-linux-bundle.zip"
+    if platform == "ios":
+        return build_apple_mobileconfig(runtime), "lmstudio-translate.mobileconfig"
+    if platform == "android":
+        return CA_CERT_PATH.read_bytes(), "lmstudio-translate-root-ca.crt"
     return build_windows_onboarding_bundle(runtime), "lmstudio-lan-windows-bundle.zip"
 
 
@@ -820,11 +1361,24 @@ def prepare_runtime() -> dict:
     ca_key, ca_cert = ensure_ca_certificate()
     ensure_server_certificate(ca_key, ca_cert)
     thumbprint = certificate_thumbprint(ca_cert)
+    lan_urls = get_lan_urls()
+    hostname_urls = get_hostname_urls()
+    bootstrap_urls = get_bootstrap_urls()
+    hostname_bootstrap_urls = get_hostname_bootstrap_urls()
+    preferred_bootstrap_url = (
+        bootstrap_urls[0]
+        if bootstrap_urls
+        else (hostname_bootstrap_urls[0] if hostname_bootstrap_urls else f"http://127.0.0.1:{BOOTSTRAP_PORT}/bootstrap")
+    )
 
     return {
         "local_url": f"https://127.0.0.1:{APP_PORT}/",
-        "lan_urls": get_lan_urls(),
-        "bootstrap_urls": get_bootstrap_urls(),
+        "lan_urls": lan_urls,
+        "hostname_urls": hostname_urls,
+        "bootstrap_urls": bootstrap_urls,
+        "hostname_bootstrap_urls": hostname_bootstrap_urls,
+        "preferred_bootstrap_url": preferred_bootstrap_url,
+        "mobile_bootstrap_qr_data_uri": build_qr_svg_data_uri(preferred_bootstrap_url),
         "pairing_pin": pin,
         "pairing_pin_expires_at_display": format_display_time(pin_expires_at),
         "ca_cert_path": str(CA_CERT_PATH),
@@ -838,6 +1392,17 @@ def prepare_runtime() -> dict:
 class ThreadedWSGIServer(ThreadingMixIn, WSGIServer):
     daemon_threads = True
     allow_reuse_address = True
+
+
+class ReloadingSSLWSGIServer(ThreadedWSGIServer):
+    certfile: str = ""
+    keyfile: str = ""
+
+    def get_request(self):
+        client_socket, client_address = super().get_request()
+        ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ssl_context.load_cert_chain(certfile=self.certfile, keyfile=self.keyfile)
+        return ssl_context.wrap_socket(client_socket, server_side=True), client_address
 
 
 class QuietWSGIRequestHandler(WSGIRequestHandler):
@@ -857,19 +1422,15 @@ def run_http_bootstrap_server() -> None:
 
 
 def run_https_server(runtime: dict) -> None:
-    ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-    ssl_context.load_cert_chain(
-        certfile=runtime["server_cert_path"],
-        keyfile=runtime["server_key_path"],
-    )
+    ReloadingSSLWSGIServer.certfile = runtime["server_cert_path"]
+    ReloadingSSLWSGIServer.keyfile = runtime["server_key_path"]
     with make_server(
         APP_HOST,
         APP_PORT,
         app,
-        server_class=ThreadedWSGIServer,
+        server_class=ReloadingSSLWSGIServer,
         handler_class=QuietWSGIRequestHandler,
     ) as server:
-        server.socket = ssl_context.wrap_socket(server.socket, server_side=True)
         server.serve_forever()
 
 
@@ -946,7 +1507,11 @@ def index():
         language_options=LANGUAGE_OPTIONS,
         initial_error=model_error or "",
         lan_urls=runtime["lan_urls"] if is_local_admin_request() else [],
+        hostname_urls=runtime["hostname_urls"] if is_local_admin_request() else [],
         bootstrap_urls=runtime["bootstrap_urls"] if is_local_admin_request() else [],
+        hostname_bootstrap_urls=runtime["hostname_bootstrap_urls"] if is_local_admin_request() else [],
+        preferred_bootstrap_url=runtime["preferred_bootstrap_url"] if is_local_admin_request() else "",
+        mobile_bootstrap_qr_data_uri=runtime["mobile_bootstrap_qr_data_uri"] if is_local_admin_request() else "",
         pairing_pin=runtime["pairing_pin"] if is_local_admin_request() else "",
         pairing_pin_expires_at_display=runtime["pairing_pin_expires_at_display"] if is_local_admin_request() else "",
         ca_thumbprint_display=runtime["ca_thumbprint_display"] if is_local_admin_request() else "",
@@ -996,6 +1561,25 @@ def regenerate_pin():
             "pairing_pin": pin,
             "pairing_pin_expires_at_display": format_display_time(expires_at),
             "message": "已生成新的 6 位 PIN。",
+        }
+    )
+
+
+@app.get("/admin/runtime")
+def admin_runtime():
+    if not is_local_admin_request():
+        return jsonify({"ok": False, "error": "仅允许本机查看局域网接入信息。"}), 403
+
+    runtime = prepare_runtime()
+    return jsonify(
+        {
+            "ok": True,
+            "lan_urls": runtime["lan_urls"],
+            "hostname_urls": runtime["hostname_urls"],
+            "bootstrap_urls": runtime["bootstrap_urls"],
+            "hostname_bootstrap_urls": runtime["hostname_bootstrap_urls"],
+            "preferred_bootstrap_url": runtime["preferred_bootstrap_url"],
+            "mobile_bootstrap_qr_data_uri": runtime["mobile_bootstrap_qr_data_uri"],
         }
     )
 
@@ -1057,12 +1641,17 @@ def download_bundle():
     requested_platform = str(request.args.get("platform", "auto")).strip().lower()
     if requested_platform == "auto":
         requested_platform = detect_client_platform(request.headers.get("User-Agent"))
-    if requested_platform not in {"windows", "macos", "linux"}:
+    if requested_platform not in {"windows", "macos", "linux", "ios", "android"}:
         requested_platform = "windows"
 
     bundle, filename = build_platform_onboarding_bundle(runtime, requested_platform)
     response = make_response(bundle)
-    response.headers["Content-Type"] = "application/zip"
+    if filename.endswith(".mobileconfig"):
+        response.headers["Content-Type"] = "application/x-apple-aspen-config"
+    elif filename.endswith(".crt"):
+        response.headers["Content-Type"] = "application/x-x509-ca-cert"
+    else:
+        response.headers["Content-Type"] = "application/zip"
     response.headers["Content-Disposition"] = f'attachment; filename="{filename}"'
     return response
 
@@ -1113,11 +1702,15 @@ def api_translate():
         return jsonify({"ok": False, "error": "请先选择或手动填写模型名。"}), 400
 
     save_config(config)
+    plan = build_translation_plan(config, source_text)
+    started_at = time.perf_counter()
 
     try:
-        translated_text, chunk_count = translate_text(config, config["base_url"], source_text)
+        translated_text, chunk_count = translate_text(config, plan, config["base_url"], source_text)
     except Exception as exc:
         return jsonify({"ok": False, "error": format_request_error(exc, "翻译")}), 400
+
+    elapsed_ms = round((time.perf_counter() - started_at) * 1000, 1)
 
     message = "翻译完成。"
     if chunk_count > 1:
@@ -1131,6 +1724,18 @@ def api_translate():
             "message": message,
             "model_name": config["model_name"],
             "chunk_count": chunk_count,
+            "elapsed_ms": elapsed_ms,
+            "elapsed_seconds": round(elapsed_ms / 1000, 2),
+            "effective_max_tokens": plan["effective_max_tokens"],
+            "configured_max_tokens": plan["configured_max_tokens"],
+            "chunk_char_limit": plan["chunk_char_limit"],
+            "effective_timeout": plan["effective_timeout"],
+            "hardware_tier": plan["hardware_tier"],
+            "estimated_chunk_count": plan["estimated_chunk_count"],
+            "tuning_summary": plan["tuning_summary"],
+            "auto_tokens_enabled": plan["auto_tokens_enabled"],
+            "gpu": gpu_snapshot_response(plan["gpu_snapshot"]),
+            "system": system_snapshot_response(plan["memory_snapshot"]),
         }
     )
 

@@ -12,24 +12,37 @@
             <p class="eyebrow">LAN Bootstrap</p>
             <h1>局域网快速接入</h1>
             <p class="subtext">
-                已检测到当前设备系统为 <strong>{{ detected_platform_label }}</strong>。
-                这一步只用于直接下载对应的一键接入包。导入根证书后，再打开 HTTPS 地址并输入主机页面显示的 6 位 PIN。
+                已识别当前设备为 <strong>{{ detected_platform_label }}</strong>。
+                先导入根证书，再打开下方 HTTPS 地址并输入本机页面显示的 6 位 PIN。
             </p>
 
             <div class="status-area">
                 <div class="lan-box">
-                    <span>快速下载</span>
-                    <p>优先点击“下载适配当前系统的一键接入包”。如果识别不准，也可以手动选择其他系统。</p>
+                    <span>自动下载</span>
+                    <p>优先点击“下载适配当前设备”。如果识别不准，也可以手动切换平台。</p>
                     <div class="inline-actions">
-                        <a class="button-link primary" href="{{ url_for('download_bundle', platform='auto') }}">下载适配当前系统的一键接入包</a>
+                        <a class="button-link primary" href="{{ url_for('download_bundle', platform='auto') }}">下载适配当前设备</a>
                         <a class="button-link secondary" href="{{ url_for('download_public_ca_cert') }}">仅下载根证书</a>
                     </div>
                     <div class="inline-actions">
-                        <a class="button-link secondary compact" href="{{ url_for('download_bundle', platform='windows') }}">Windows 包</a>
-                        <a class="button-link secondary compact" href="{{ url_for('download_bundle', platform='macos') }}">macOS 包</a>
-                        <a class="button-link secondary compact" href="{{ url_for('download_bundle', platform='linux') }}">Linux 包</a>
+                        <a class="button-link secondary compact" href="{{ url_for('download_bundle', platform='ios') }}">iPhone / iPad</a>
+                        <a class="button-link secondary compact" href="{{ url_for('download_bundle', platform='android') }}">Android</a>
+                        <a class="button-link secondary compact" href="{{ url_for('download_bundle', platform='windows') }}">Windows</a>
+                        <a class="button-link secondary compact" href="{{ url_for('download_bundle', platform='macos') }}">macOS</a>
+                        <a class="button-link secondary compact" href="{{ url_for('download_bundle', platform='linux') }}">Linux</a>
                     </div>
                 </div>
+
+                {% if detected_platform in ["ios", "android"] %}
+                <div class="lan-box">
+                    <span>手机自动接入</span>
+                    {% if detected_platform == "ios" %}
+                    <p>当前识别为 iPhone / iPad。下载描述文件后，按系统提示完成安装，并在“设置 > 通用 > 关于本机 > 证书信任设置”里开启完全信任。</p>
+                    {% else %}
+                    <p>当前识别为 Android。下载根证书后，将它导入当前手机的凭据存储，再用浏览器打开下面的 HTTPS 地址。</p>
+                    {% endif %}
+                </div>
+                {% endif %}
 
                 <div class="lan-box">
                     <span>接入后打开</span>
@@ -38,17 +51,25 @@
                         <li><code>{{ lan_url }}</code></li>
                         {% endfor %}
                     </ul>
+                    {% if runtime.hostname_urls %}
+                    <small class="field-help">如果手机能解析主机名，也可以优先尝试下面这些稳定地址：</small>
+                    <ul>
+                        {% for hostname_url in runtime.hostname_urls %}
+                        <li><code>{{ hostname_url }}</code></li>
+                        {% endfor %}
+                    </ul>
+                    {% endif %}
                 </div>
 
                 <div class="fingerprint-box">
                     <span>安装前请核对根证书 SHA-256 指纹</span>
                     <code>{{ runtime.ca_thumbprint_display }}</code>
-                    <small class="field-help">请和主机页面显示的指纹对照一致后再安装。这一步是为了避免 HTTP 快速接入页被中间人篡改。</small>
+                    <small class="field-help">请和本机页面显示的指纹核对一致后再安装，避免 HTTP 快速接入页被中间人篡改。</small>
                 </div>
 
                 <div class="note-box">
                     <strong>边界说明</strong>
-                    <p>浏览器网页不能直接把根证书静默装进 Windows、macOS 或 Linux 的系统信任区。这是操作系统和浏览器的安全边界。当前版本已经把流程压缩成：打开局域网页面，自动识别系统，直接下载对应导入包。</p>
+                    <p>网页可以自动识别手机平台并提供对应下载入口，但浏览器不能越过系统安全边界，直接静默安装根证书。当前版本已经把流程压缩为：打开接入页、自动识别设备、下载对应证书包、导入完成后直接访问 HTTPS 页面。</p>
                 </div>
             </div>
         </section>
