@@ -3,33 +3,188 @@
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>HTTPS 局域网接入</title>
+    <title>局域网设备接入</title>
     <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
 </head>
 <body>
     <div class="shell shell-narrow">
-        <section class="panel login-panel">
+        <section class="panel login-panel request-panel">
             <p class="eyebrow">LAN Access</p>
-            <h1>输入 6 位接入 PIN</h1>
+            <h1>申请接入这台主机</h1>
             <p class="subtext">
-                你当前是通过局域网访问这台翻译服务器。为了同时解决未授权访问、抓包泄露和中间人篡改，
-                需要先在这台设备上导入本机根证书，再通过 HTTPS 打开页面并输入 6 位 PIN。
+                这台设备已经连到主机的 HTTPS 页面。下一步不是输入 PIN，而是发送接入申请，等待主端网页审批。
+                批准后，这台设备会长期保持访问权限，直到主端手动撤销。
             </p>
-            {% if error_message %}
-            <div class="message error">{{ error_message }}</div>
-            {% endif %}
-            <form class="login-form" method="post" action="{{ url_for('login') }}">
+
+            <div class="request-meta-grid">
+                <div class="request-meta-card">
+                    <span>当前设备类型</span>
+                    <strong>{{ device_platform_label }}</strong>
+                </div>
+                <div class="request-meta-card">
+                    <span>当前来源 IP</span>
+                    <strong>{{ device_ip }}</strong>
+                </div>
+            </div>
+
+            <div id="access_message" class="message {% if error_message %}error{% else %}hidden{% endif %}">
+                {{ error_message }}
+            </div>
+
+            <div id="request_state" class="request-state-box"></div>
+
+            <div class="login-form">
                 <label>
-                    <span>6 位 PIN</span>
-                    <input type="password" inputmode="numeric" maxlength="6" name="pairing_pin" autocomplete="one-time-code" placeholder="请输入 6 位 PIN">
+                    <span>设备名称</span>
+                    <input type="text" id="device_label" value="{{ device_label }}" placeholder="例如：办公室 MacBook / Android 手机">
+                    <small class="field-help">主端审批后台会显示这个名称。你可以按设备位置或用途来命名，方便后续撤销。</small>
                 </label>
-                <label class="checkbox-row">
-                    <input type="checkbox" name="remember_device" value="1" checked>
-                    <span>信任这台设备 30 天</span>
-                </label>
-                <button class="primary" type="submit">进入翻译台</button>
-            </form>
+
+                <div class="inline-actions">
+                    <button class="primary" type="button" id="request_access">发送接入申请</button>
+                    <button class="secondary" type="button" id="refresh_status">刷新状态</button>
+                </div>
+            </div>
+
+            <div class="note-box">
+                <strong>当前流程</strong>
+                <p>1. 先信任这台主机的根证书。</p>
+                <p>2. 在这里发送接入申请。</p>
+                <p>3. 回到主机网页批准这台设备。</p>
+                <p>4. 批准后当前页面会自动跳转到翻译页。</p>
+            </div>
         </section>
     </div>
+
+    <script>
+        const initialStatus = {{ access_status|tojson }};
+        const initialRecord = {{ request_record|tojson }};
+
+        const elements = {
+            message: document.getElementById("access_message"),
+            requestState: document.getElementById("request_state"),
+            deviceLabel: document.getElementById("device_label"),
+            requestAccess: document.getElementById("request_access"),
+            refreshStatus: document.getElementById("refresh_status"),
+        };
+
+        let pollTimer = null;
+
+        function setMessage(text, kind = "success") {
+            elements.message.textContent = text;
+            elements.message.classList.remove("hidden", "success", "error");
+            elements.message.classList.add(kind);
+        }
+
+        function renderState(status, record) {
+            elements.requestState.classList.remove("state-none", "state-pending", "state-approved");
+
+            if (status === "approved") {
+                elements.requestState.classList.add("state-approved");
+                elements.requestState.innerHTML = `
+                    <strong>这台设备已经被批准</strong>
+                    <p>主端已放行当前设备，页面即将自动跳转到翻译页。</p>
+                `;
+                window.clearInterval(pollTimer);
+                window.setTimeout(() => {
+                    window.location.replace("/");
+                }, 600);
+                return;
+            }
+
+            if (status === "pending") {
+                const requestedAt = record?.last_requested_at_display || "刚刚";
+                const requestCount = record?.request_count || 1;
+                elements.requestState.classList.add("state-pending");
+                elements.requestState.innerHTML = `
+                    <strong>接入申请已提交</strong>
+                    <p>主端后台还没有批准这台设备。最近一次申请时间：${requestedAt}，累计提交 ${requestCount} 次。</p>
+                `;
+                return;
+            }
+
+            elements.requestState.classList.add("state-none");
+            elements.requestState.innerHTML = `
+                <strong>当前还没有接入申请</strong>
+                <p>点击“发送接入申请”后，主端网页里会出现这台设备，批准一次即可长期访问。</p>
+            `;
+        }
+
+        async function postJson(url, payload) {
+            const response = await fetch(url, {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json",
+                },
+                body: JSON.stringify(payload),
+                credentials: "same-origin",
+            });
+            const data = await response.json();
+            if (!response.ok || !data.ok) {
+                throw new Error(data.error || "请求失败。");
+            }
+            return data;
+        }
+
+        async function getJson(url) {
+            const response = await fetch(url, {
+                method: "GET",
+                credentials: "same-origin",
+                cache: "no-store",
+            });
+            const data = await response.json();
+            if (!response.ok || !data.ok) {
+                throw new Error(data.error || "请求失败。");
+            }
+            return data;
+        }
+
+        async function submitAccessRequest() {
+            elements.requestAccess.disabled = true;
+            try {
+                const data = await postJson("/access/request", {
+                    device_label: elements.deviceLabel.value.trim(),
+                });
+                renderState(data.status, data.request_record);
+                setMessage(data.message, "success");
+                if (data.status === "pending") {
+                    startPolling();
+                }
+            } catch (error) {
+                setMessage(error.message, "error");
+            } finally {
+                elements.requestAccess.disabled = false;
+            }
+        }
+
+        async function refreshStatus() {
+            try {
+                const data = await getJson("/access/status");
+                renderState(data.status, data.request_record);
+                if (data.status === "approved") {
+                    setMessage("主端已经批准这台设备，正在进入翻译页。", "success");
+                }
+            } catch (error) {
+                setMessage(error.message, "error");
+            }
+        }
+
+        function startPolling() {
+            window.clearInterval(pollTimer);
+            pollTimer = window.setInterval(refreshStatus, 3000);
+        }
+
+        elements.requestAccess.addEventListener("click", submitAccessRequest);
+        elements.refreshStatus.addEventListener("click", refreshStatus);
+
+        renderState(initialStatus, initialRecord);
+        if (initialStatus === "pending") {
+            startPolling();
+        } else if (initialStatus === "approved") {
+            window.setTimeout(() => {
+                window.location.replace("/");
+            }, 400);
+        }
+    </script>
 </body>
 </html>

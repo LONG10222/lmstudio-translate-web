@@ -13,42 +13,77 @@
                 <p class="eyebrow">Local LLM Translation</p>
                 <h1>LM Studio 本地翻译台</h1>
                 <p class="subtext">
-                    页面现在通过 HTTPS 提供局域网访问，后端仍然只允许连接本机 LM Studio 回环地址。
-                    本机管理员可以发放 6 位 PIN，其他设备导入根证书后即可安全接入，并通过受信设备会话长期使用。
+                    网页翻译请求仍然只允许发给本机 `LM Studio` 回环地址。局域网接入现在改成“远端申请、本机批准、长期受信任设备”，
+                    去掉了每次人工传 PIN 的旧链路，同时保留 HTTPS、根证书和本机模型约束。
                 </p>
             </div>
             <div class="privacy-card">
                 <div class="access-summary-row">
                     <div class="access-summary-copy">
-                        <strong>局域网接入</strong>
-                        <p class="privacy-summary">默认只走本机 LM Studio。需要时再展开接入、证书和跨系统说明。</p>
+                        <strong>{{ "局域网接入后台" if local_admin else "当前设备已受信任" }}</strong>
+                        <p class="privacy-summary">
+                            {% if local_admin %}
+                            新设备会先提交接入申请。你在本机网页批准一次后，这台设备会长期访问，直到你手动撤销。
+                            {% else %}
+                            这台设备已经被主端批准，后续打开网页可直接进入翻译。需要取消时，可以在主端后台撤销，或在这里移除此设备授权。
+                            {% endif %}
+                        </p>
                     </div>
-                    {% if pairing_pin %}
                     <div class="access-pill-group">
+                        {% if local_admin %}
                         <div class="access-pill">
-                            <span>6 位 PIN</span>
-                            <code id="pairing_pin">{{ pairing_pin }}</code>
+                            <span>待审批</span>
+                            <code id="pending_count">{{ pending_count }}</code>
                         </div>
-                        <button class="secondary compact" type="button" id="copy_pin">复制 PIN</button>
+                        <div class="access-pill">
+                            <span>已授权</span>
+                            <code id="approved_count">{{ approved_count }}</code>
+                        </div>
+                        {% else %}
+                        <div class="access-pill">
+                            <span>设备状态</span>
+                            <code>已批准</code>
+                        </div>
+                        {% endif %}
                     </div>
-                    {% endif %}
                 </div>
+
+                {% if local_admin %}
                 <details class="access-details">
                     <summary>管理局域网接入与证书</summary>
                     <div class="access-details-body">
-                        {% if pairing_pin %}
                         <div class="access-grid">
-                            <div class="lan-box">
-                                <span>接入控制</span>
-                                <p>其他电脑首次访问时只需输入当前 6 位 PIN。登录后可通过受信设备会话继续使用。</p>
-                                <div class="inline-actions">
-                                    <button class="secondary compact" type="button" id="refresh_pin">重新生成 PIN</button>
+                            <div class="lan-box device-admin-panel">
+                                <span>审批后台</span>
+                                <p>新设备访问 HTTPS 页面后，会先发起接入申请。你在这里批准后，该设备就会长期保持访问权限。</p>
+                                <div class="device-summary-grid">
+                                    <div class="device-stat">
+                                        <strong id="pending_count_panel">{{ pending_count }}</strong>
+                                        <small>待审批</small>
+                                    </div>
+                                    <div class="device-stat">
+                                        <strong id="approved_count_panel">{{ approved_count }}</strong>
+                                        <small>已授权</small>
+                                    </div>
                                 </div>
-                                <small id="pairing_pin_expires" class="field-help">有效期至：{{ pairing_pin_expires_at_display }}</small>
+                                <div class="device-list-block">
+                                    <div class="device-list-head">
+                                        <strong>待审批设备</strong>
+                                        <button class="secondary compact" type="button" id="refresh_access_admin">刷新</button>
+                                    </div>
+                                    <div id="pending_devices" class="device-list"></div>
+                                </div>
+                                <div class="device-list-block">
+                                    <div class="device-list-head">
+                                        <strong>长期受信任设备</strong>
+                                    </div>
+                                    <div id="approved_devices" class="device-list"></div>
+                                </div>
                             </div>
+
                             <div class="lan-box">
                                 <span>证书与下载</span>
-                                <p>Windows 可直接使用一键接入包。macOS 和 Linux 也能连接，但仍需要先信任这台主机生成的根证书。</p>
+                                <p>其他设备仍然需要先信任这台主机生成的根证书。审批后台解决的是访问控制，不替代 HTTPS 证书信任。</p>
                                 <div class="inline-actions">
                                     <a class="button-link secondary compact" href="{{ url_for('download_ca_cert') }}">下载根证书</a>
                                     <a class="button-link secondary compact" href="{{ url_for('download_windows_bundle') }}">下载 Windows 一键接入包</a>
@@ -62,18 +97,17 @@
                                 </div>
                             </div>
                         </div>
-                        {% endif %}
-                        {% if lan_urls %}
+
                         <div class="lan-box">
-                            <span>局域网地址</span>
-                            <p>其他设备在信任根证书后，打开下面任一 HTTPS 地址，再输入上面的 6 位 PIN。</p>
+                            <span>局域网 HTTPS 地址</span>
+                            <p>其他设备导入根证书后，先打开下面任一 HTTPS 地址，页面会自动生成接入申请并等待本机审批。</p>
                             <ul id="lan_url_list">
                                 {% for lan_url in lan_urls %}
                                 <li><code>{{ lan_url }}</code></li>
                                 {% endfor %}
                             </ul>
                             {% if hostname_urls %}
-                            <small class="field-help">如果手机或其他电脑能解析主机名，也可以尝试下面这些稳定地址：</small>
+                            <small class="field-help">如果局域网能解析主机名，也可以优先使用下面这些更稳定的地址。</small>
                             <ul id="hostname_url_list">
                                 {% for hostname_url in hostname_urls %}
                                 <li><code>{{ hostname_url }}</code></li>
@@ -81,18 +115,17 @@
                             </ul>
                             {% endif %}
                         </div>
-                        {% endif %}
-                        {% if bootstrap_urls %}
+
                         <div class="lan-box">
                             <span>快速接入页</span>
-                            <p>其他电脑可以先打开下面任一 HTTP 地址。页面会自动识别系统，并直接提供对应的一键接入包下载。</p>
+                            <p>其他电脑、手机或平板可以先打开下面任一 HTTP 快速接入页。页面会自动识别系统并提供对应的根证书下载入口。</p>
                             <ul id="bootstrap_url_list">
                                 {% for bootstrap_url in bootstrap_urls %}
                                 <li><code>{{ bootstrap_url }}</code></li>
                                 {% endfor %}
                             </ul>
                             {% if hostname_bootstrap_urls %}
-                            <small class="field-help">如果局域网 DNS 可用，换 Wi-Fi 后也可以优先试这些主机名入口：</small>
+                            <small class="field-help">如果局域网 DNS 可用，换 Wi‑Fi 后也可以优先试这些主机名入口。</small>
                             <ul id="hostname_bootstrap_url_list">
                                 {% for hostname_bootstrap_url in hostname_bootstrap_urls %}
                                 <li><code>{{ hostname_bootstrap_url }}</code></li>
@@ -100,47 +133,46 @@
                             </ul>
                             {% endif %}
                         </div>
+
                         <div class="lan-box mobile-entry-box">
                             <span>手机接入</span>
-                            <p>手机直接扫描下面的二维码即可打开当前局域网快速接入页。页面会自动识别 iPhone / Android，并给出对应证书导入方式。</p>
+                            <p>手机直接扫描下面二维码即可打开当前局域网快速接入页。导入证书后再访问 HTTPS 页面，手机端会自动走接入申请流程。</p>
                             <div class="mobile-entry-grid">
                                 <img id="mobile_bootstrap_qr" src="{{ mobile_bootstrap_qr_data_uri }}" alt="手机快速接入二维码">
                                 <div class="mobile-entry-copy">
                                     <code id="preferred_bootstrap_url">{{ preferred_bootstrap_url }}</code>
-                                    <small class="field-help">如果切换了 Wi-Fi，本机页面会自动刷新这里的地址和二维码。</small>
+                                    <small class="field-help">如果切换了 Wi‑Fi，本机页面会自动刷新这里的局域网地址和二维码。</small>
                                 </div>
                             </div>
                         </div>
-                        {% endif %}
+
                         <div class="os-help-grid">
                             <div class="os-card">
                                 <span>Windows</span>
-                                <p>优先使用一键接入包。解压后运行 <code>Install-RootCA.ps1</code>，再打开上面的 HTTPS 地址。</p>
+                                <p>优先使用一键接入包。导入根证书后，直接打开 HTTPS 地址并点击“发送接入申请”。</p>
                             </div>
                             <div class="os-card">
                                 <span>macOS</span>
-                                <p>下载根证书后导入钥匙串，并把它设为“始终信任”。也可以用命令行导入系统信任区。</p>
+                                <p>导入根证书到钥匙串并设为始终信任，然后打开 HTTPS 地址提交接入申请。</p>
                                 <code>sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain lmstudio-translate-root-ca.crt</code>
                             </div>
                             <div class="os-card">
                                 <span>Linux</span>
-                                <p>先导入系统证书存储，再访问 HTTPS 地址。Firefox 在部分发行版上可能还要单独导入证书。</p>
+                                <p>先把根证书导入系统证书存储，再访问 HTTPS 地址提交接入申请。Firefox 可能还需要单独导入。</p>
                                 <code>sudo cp lmstudio-translate-root-ca.crt /usr/local/share/ca-certificates/ && sudo update-ca-certificates</code>
                             </div>
                         </div>
+
                         <details class="privacy-details">
                             <summary>显示隐私约束</summary>
                             <div class="privacy-details-body">
-                                <p>翻译请求只会从网页发到这台电脑，再由这台电脑发给本机 <code>LM Studio</code>。后端会拒绝公网、域名和局域网形式的 LM Studio 地址。</p>
-                                <p>如果其他电脑要通过局域网访问，为了防抓包和中间人篡改，仍然需要先信任这台主机生成的根证书。网页 PIN 只能控制访问权限，不能替代 TLS 证书信任。</p>
+                                <p>翻译请求只会从当前网页发到这台主机，再由这台主机发给本机 `LM Studio`。后端会拒绝公网、域名和局域网形式的远程 `LM Studio` 地址。</p>
+                                <p>接入审批只是访问控制。真正防抓包和中间人篡改的前提，仍然是其他设备先信任这台主机生成的根证书。</p>
                             </div>
                         </details>
-                        <div class="note-box">
-                            <strong>为什么不能只靠网页认证</strong>
-                            <p>因为浏览器在建立安全连接之前，就必须先判断这台主机的证书是否可信。只靠网页里的 PIN 或登录表单，不能解决抓包和中间人篡改问题。</p>
-                        </div>
                     </div>
                 </details>
+                {% endif %}
             </div>
         </header>
 
@@ -176,7 +208,7 @@
                         <label>
                             <span>模型名</span>
                             <input type="text" id="model_name" value="{{ config.model_name }}">
-                            <small class="field-help">可直接手动填写 LM Studio 已加载的任意模型名。</small>
+                            <small class="field-help">可以直接手动填写 LM Studio 已加载的任意模型名。</small>
                         </label>
                     </div>
 
@@ -205,12 +237,12 @@
                         <label>
                             <span>最大输出 Tokens</span>
                             <input type="number" id="max_tokens" min="64" max="8192" value="{{ config.max_tokens }}">
-                            <small class="field-help">长文本会自动分段翻译。这个值过低时，单段译文仍可能被截断。</small>
+                            <small class="field-help">长文本会自动分段翻译，这里控制单段上限。</small>
                         </label>
                     </div>
 
                     <div class="status-area">
-                        <div id="message" class="message {% if initial_error %}error{% endif %} {% if not initial_error %}hidden{% endif %}">
+                        <div id="message" class="message {% if initial_error %}error{% else %}hidden{% endif %}">
                             {{ initial_error }}
                         </div>
                         <div class="progress-shell">
@@ -224,16 +256,16 @@
                         </div>
                         <div id="runtime_metrics" class="runtime-metrics hidden">
                             <div class="metric-card">
-                                <span>&#26412;&#22320;&#32791;&#26102;</span>
+                                <span>本地耗时</span>
                                 <strong id="elapsed_time">-</strong>
                             </div>
                             <div class="metric-card">
-                                <span>&#23454;&#38469; Tokens</span>
+                                <span>实际 Tokens</span>
                                 <strong id="effective_tokens">-</strong>
                             </div>
                             <div class="metric-card metric-card-wide">
-                                <span>&#30828;&#20214;&#35843;&#20248;</span>
-                                <strong id="tuning_summary">&#26410;&#35835;&#21462;</strong>
+                                <span>硬件调优</span>
+                                <strong id="tuning_summary">未读取</strong>
                             </div>
                         </div>
                     </div>
@@ -262,9 +294,11 @@
                     </div>
 
                     <div class="actions">
+                        {% if not local_admin %}
                         <form method="post" action="{{ url_for('logout') }}">
-                            <button class="secondary" type="submit">退出当前设备会话</button>
+                            <button class="secondary" type="submit">移除此设备授权</button>
                         </form>
+                        {% endif %}
                         <button class="secondary" type="button" id="clear_all">清空</button>
                         <button class="primary" type="button" id="translate_button">开始翻译</button>
                     </div>
@@ -274,6 +308,20 @@
     </div>
 
     <script>
+        const isLocalAdmin = {{ local_admin|tojson }};
+        const initialAccessRuntime = {{ {
+            "lan_urls": lan_urls,
+            "hostname_urls": hostname_urls,
+            "bootstrap_urls": bootstrap_urls,
+            "hostname_bootstrap_urls": hostname_bootstrap_urls,
+            "preferred_bootstrap_url": preferred_bootstrap_url,
+            "mobile_bootstrap_qr_data_uri": mobile_bootstrap_qr_data_uri,
+            "pending_devices": pending_devices,
+            "approved_devices": approved_devices,
+            "pending_count": pending_count,
+            "approved_count": approved_count,
+        } | tojson }};
+
         const elements = {
             baseUrl: document.getElementById("base_url"),
             apiKey: document.getElementById("api_key"),
@@ -299,10 +347,6 @@
             copySource: document.getElementById("copy_source"),
             copyTarget: document.getElementById("copy_target"),
             clearAll: document.getElementById("clear_all"),
-            copyPin: document.getElementById("copy_pin"),
-            refreshPin: document.getElementById("refresh_pin"),
-            pairingPin: document.getElementById("pairing_pin"),
-            pairingPinExpires: document.getElementById("pairing_pin_expires"),
             caThumbprint: document.getElementById("ca_thumbprint"),
             copyThumbprint: document.getElementById("copy_thumbprint"),
             lanUrlList: document.getElementById("lan_url_list"),
@@ -311,6 +355,13 @@
             hostnameBootstrapUrlList: document.getElementById("hostname_bootstrap_url_list"),
             preferredBootstrapUrl: document.getElementById("preferred_bootstrap_url"),
             mobileBootstrapQr: document.getElementById("mobile_bootstrap_qr"),
+            pendingCount: document.getElementById("pending_count"),
+            approvedCount: document.getElementById("approved_count"),
+            pendingCountPanel: document.getElementById("pending_count_panel"),
+            approvedCountPanel: document.getElementById("approved_count_panel"),
+            pendingDevices: document.getElementById("pending_devices"),
+            approvedDevices: document.getElementById("approved_devices"),
+            refreshAccessAdmin: document.getElementById("refresh_access_admin"),
         };
 
         let progressTimer = null;
@@ -349,16 +400,16 @@
             elements.runtimeMetrics.classList.add("hidden");
             elements.elapsedTime.textContent = "-";
             elements.effectiveTokens.textContent = "-";
-            elements.tuningSummary.textContent = "\u672a\u8bfb\u53d6";
+            elements.tuningSummary.textContent = "未读取";
         }
 
         function updateRuntimeMetrics(data) {
             elements.runtimeMetrics.classList.remove("hidden");
             elements.elapsedTime.textContent = `${data.elapsed_seconds ?? 0}s / ${data.elapsed_ms ?? 0} ms`;
             elements.effectiveTokens.textContent = data.auto_tokens_enabled
-                ? `${data.effective_max_tokens} / ${data.configured_max_tokens} · ${data.chunk_char_limit}字/段`
-                : `${data.effective_max_tokens} · ${data.chunk_char_limit}字/段`;
-            elements.tuningSummary.textContent = data.tuning_summary || "\u672a\u8bfb\u53d6";
+                ? `${data.effective_max_tokens} / ${data.configured_max_tokens} · ${data.chunk_char_limit} 字/段`
+                : `${data.effective_max_tokens} · ${data.chunk_char_limit} 字/段`;
+            elements.tuningSummary.textContent = data.tuning_summary || "未读取";
         }
 
         function startProgress() {
@@ -403,18 +454,6 @@
             return data;
         }
 
-        async function postAdmin(url) {
-            const response = await fetch(url, {
-                method: "POST",
-                credentials: "same-origin",
-            });
-            const data = await response.json();
-            if (!response.ok || !data.ok) {
-                throw new Error(data.error || "请求失败。");
-            }
-            return data;
-        }
-
         async function getJson(url) {
             const response = await fetch(url, {
                 method: "GET",
@@ -442,6 +481,98 @@
             }
         }
 
+        function setCountValue(target, value) {
+            if (target) {
+                target.textContent = String(value ?? 0);
+            }
+        }
+
+        function appendMetaRow(target, label, value) {
+            if (!value) {
+                return;
+            }
+            const row = document.createElement("p");
+            const strong = document.createElement("strong");
+            strong.textContent = `${label}：`;
+            row.appendChild(strong);
+            row.appendChild(document.createTextNode(value));
+            target.appendChild(row);
+        }
+
+        function createDeviceActionButton(label, action, deviceIdHash, variant = "secondary") {
+            const button = document.createElement("button");
+            button.type = "button";
+            button.className = `${variant} compact`;
+            button.dataset.action = action;
+            button.dataset.deviceIdHash = deviceIdHash;
+            button.textContent = label;
+            return button;
+        }
+
+        function createDeviceCard(device, mode) {
+            const article = document.createElement("article");
+            article.className = "device-card";
+
+            const head = document.createElement("div");
+            head.className = "device-card-head";
+
+            const titleWrap = document.createElement("div");
+            titleWrap.className = "device-card-title";
+
+            const title = document.createElement("strong");
+            title.textContent = device.device_label || "未命名设备";
+            titleWrap.appendChild(title);
+
+            const tag = document.createElement("span");
+            tag.className = "device-platform-tag";
+            tag.textContent = device.platform_label || "未知设备";
+            titleWrap.appendChild(tag);
+
+            const fingerprint = document.createElement("small");
+            fingerprint.textContent = `设备指纹 ${device.device_fingerprint}`;
+            titleWrap.appendChild(fingerprint);
+            head.appendChild(titleWrap);
+
+            const actions = document.createElement("div");
+            actions.className = "device-card-actions";
+            if (mode === "pending") {
+                actions.appendChild(createDeviceActionButton("批准", "approve", device.device_id_hash, "primary"));
+                actions.appendChild(createDeviceActionButton("拒绝", "reject", device.device_id_hash));
+            } else if (mode === "approved") {
+                actions.appendChild(createDeviceActionButton("撤销", "revoke", device.device_id_hash));
+            }
+            head.appendChild(actions);
+            article.appendChild(head);
+
+            const meta = document.createElement("div");
+            meta.className = "device-card-meta";
+            appendMetaRow(meta, "来源 IP", device.last_seen_ip || device.first_seen_ip);
+            appendMetaRow(meta, "申请时间", device.last_requested_at_display);
+            appendMetaRow(meta, "批准时间", device.approved_at_display);
+            appendMetaRow(meta, "最近访问", device.last_seen_at_display);
+            appendMetaRow(meta, "申请次数", device.request_count ? String(device.request_count) : "");
+            appendMetaRow(meta, "User-Agent", device.user_agent);
+            article.appendChild(meta);
+            return article;
+        }
+
+        function renderDeviceList(target, devices, mode) {
+            if (!target) {
+                return;
+            }
+            target.innerHTML = "";
+            if (!devices || devices.length === 0) {
+                const empty = document.createElement("div");
+                empty.className = "device-empty";
+                empty.textContent = mode === "pending" ? "当前没有待审批设备。" : "当前没有长期受信任设备。";
+                target.appendChild(empty);
+                return;
+            }
+            for (const device of devices) {
+                target.appendChild(createDeviceCard(device, mode));
+            }
+        }
+
         function applyRuntimeAccessInfo(data) {
             renderUrlList(elements.lanUrlList, data.lan_urls);
             renderUrlList(elements.hostnameUrlList, data.hostname_urls);
@@ -453,10 +584,16 @@
             if (elements.mobileBootstrapQr && data.mobile_bootstrap_qr_data_uri) {
                 elements.mobileBootstrapQr.src = data.mobile_bootstrap_qr_data_uri;
             }
+            setCountValue(elements.pendingCount, data.pending_count);
+            setCountValue(elements.approvedCount, data.approved_count);
+            setCountValue(elements.pendingCountPanel, data.pending_count);
+            setCountValue(elements.approvedCountPanel, data.approved_count);
+            renderDeviceList(elements.pendingDevices, data.pending_devices || [], "pending");
+            renderDeviceList(elements.approvedDevices, data.approved_devices || [], "approved");
         }
 
         async function refreshAccessRuntime() {
-            if (!elements.copyPin) {
+            if (!isLocalAdmin) {
                 return;
             }
             try {
@@ -464,6 +601,25 @@
                 applyRuntimeAccessInfo(data);
             } catch (error) {
                 console.error(error);
+            }
+        }
+
+        async function handleAdminAction(action, deviceIdHash) {
+            const routeMap = {
+                approve: "/admin/access/approve",
+                reject: "/admin/access/reject",
+                revoke: "/admin/access/revoke",
+            };
+            const route = routeMap[action];
+            if (!route) {
+                return;
+            }
+            try {
+                const data = await postJson(route, { device_id_hash: deviceIdHash });
+                applyRuntimeAccessInfo(data);
+                setMessage(data.message, "success");
+            } catch (error) {
+                setMessage(error.message, "error");
             }
         }
 
@@ -553,7 +709,6 @@
                 setMessage("当前没有可复制的内容。", "error");
                 return;
             }
-
             try {
                 await navigator.clipboard.writeText(text);
                 setMessage(successMessage, "success");
@@ -570,21 +725,6 @@
             setMessage("已清空原文和译文。", "success");
         }
 
-        async function regeneratePin() {
-            try {
-                const data = await postAdmin("/admin/pin/regenerate");
-                if (elements.pairingPin) {
-                    elements.pairingPin.textContent = data.pairing_pin;
-                }
-                if (elements.pairingPinExpires) {
-                    elements.pairingPinExpires.textContent = `有效期至：${data.pairing_pin_expires_at_display}`;
-                }
-                setMessage(data.message, "success");
-            } catch (error) {
-                setMessage(error.message, "error");
-            }
-        }
-
         elements.modelSelect.addEventListener("change", syncModelInputFromSelect);
         elements.refreshModels.addEventListener("click", handleRefreshModels);
         elements.translateButton.addEventListener("click", handleTranslate);
@@ -592,20 +732,36 @@
         elements.copySource.addEventListener("click", () => copyText(elements.sourceText.value, "原文已复制。"));
         elements.copyTarget.addEventListener("click", () => copyText(elements.translatedText.value, "译文已复制。"));
         elements.clearAll.addEventListener("click", clearEditors);
-        if (elements.copyPin && elements.pairingPin) {
-            elements.copyPin.addEventListener("click", () => copyText(elements.pairingPin.textContent, "6 位 PIN 已复制。"));
-        }
-        if (elements.refreshPin) {
-            elements.refreshPin.addEventListener("click", regeneratePin);
-        }
+
         if (elements.copyThumbprint && elements.caThumbprint) {
             elements.copyThumbprint.addEventListener("click", () => copyText(elements.caThumbprint.textContent, "根证书指纹已复制。"));
+        }
+        if (elements.pendingDevices) {
+            elements.pendingDevices.addEventListener("click", (event) => {
+                const button = event.target.closest("button[data-action]");
+                if (!button) {
+                    return;
+                }
+                handleAdminAction(button.dataset.action, button.dataset.deviceIdHash);
+            });
+        }
+        if (elements.approvedDevices) {
+            elements.approvedDevices.addEventListener("click", (event) => {
+                const button = event.target.closest("button[data-action]");
+                if (!button) {
+                    return;
+                }
+                handleAdminAction(button.dataset.action, button.dataset.deviceIdHash);
+            });
+        }
+        if (elements.refreshAccessAdmin) {
+            elements.refreshAccessAdmin.addEventListener("click", refreshAccessRuntime);
         }
 
         setIdleProgress();
         resetRuntimeMetrics();
-        if (elements.copyPin) {
-            refreshAccessRuntime();
+        if (isLocalAdmin) {
+            applyRuntimeAccessInfo(initialAccessRuntime);
             window.setInterval(refreshAccessRuntime, 15000);
         }
     </script>

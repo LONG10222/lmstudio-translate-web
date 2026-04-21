@@ -52,12 +52,14 @@ SERVER_CERT_PATH = TLS_DIR / "lan-server.crt"
 SERVER_KEY_PATH = TLS_DIR / "lan-server.key"
 
 COOKIE_NAME = "lmstudio_translate_session"
+DEVICE_ID_COOKIE_NAME = "lmstudio_translate_device"
 APP_HOST = "0.0.0.0"
 APP_PORT = 7870
 BOOTSTRAP_PORT = 7871
 PIN_TTL_MINUTES = 10
 TRUST_DEVICE_DAYS = 30
 TEMP_SESSION_HOURS = 12
+DEVICE_COOKIE_MAX_AGE = 60 * 60 * 24 * 365 * 5
 MIN_TRANSLATION_MAX_TOKENS = 256
 MAX_TRANSLATION_MAX_TOKENS = 4096
 MIN_CHUNK_CHARS = 700
@@ -186,6 +188,8 @@ def load_security_config() -> dict:
         "pairing_pin": None,
         "pairing_pin_expires_at": None,
         "device_sessions": [],
+        "pending_devices": [],
+        "approved_devices": [],
     }
     if SECURITY_PATH.exists():
         with open(SECURITY_PATH, "r", encoding="utf-8") as file:
@@ -202,6 +206,17 @@ def load_security_config() -> dict:
     if pin_expires_at is None or pin_expires_at <= utc_now():
         security["pairing_pin"] = None
         security["pairing_pin_expires_at"] = None
+
+    security["pending_devices"] = [
+        device
+        for device in security.get("pending_devices", [])
+        if str(device.get("device_id_hash", "")).strip()
+    ]
+    security["approved_devices"] = [
+        device
+        for device in security.get("approved_devices", [])
+        if str(device.get("device_id_hash", "")).strip()
+    ]
 
     return security
 
@@ -266,6 +281,208 @@ def remove_device_session(security: dict, raw_token: str | None) -> None:
         for session in security.get("device_sessions", [])
         if session.get("token_hash") != token_hash
     ]
+    save_security_config(security)
+
+
+def hash_device_id(device_id: str) -> str:
+    return hash_token(f"device::{device_id}")
+
+
+def normalize_device_label(label: str | None, fallback: str) -> str:
+    collapsed = re.sub(r"\s+", " ", str(label or "")).strip()
+    return (collapsed or fallback)[:80]
+
+
+def normalize_user_agent(user_agent: str | None) -> str:
+    return re.sub(r"\s+", " ", str(user_agent or "")).strip()[:240]
+
+
+def current_device_platform() -> str:
+    return detect_client_platform(request.headers.get("User-Agent"))
+
+
+def current_device_ip() -> str:
+    remote_ip = get_remote_ip()
+    return str(remote_ip) if remote_ip else (request.remote_addr or "")
+
+
+def default_device_label(platform: str, remote_ip: str) -> str:
+    label = platform_label(platform)
+    return f"{label} · {remote_ip}" if remote_ip else label
+
+
+def ensure_device_id() -> tuple[str, bool]:
+    raw_device_id = str(request.cookies.get(DEVICE_ID_COOKIE_NAME, "")).strip()
+    if raw_device_id:
+        return raw_device_id, False
+    return secrets.token_urlsafe(32), True
+
+
+def attach_device_cookie(response, raw_device_id: str) -> None:
+    response.set_cookie(
+        DEVICE_ID_COOKIE_NAME,
+        raw_device_id,
+        max_age=DEVICE_COOKIE_MAX_AGE,
+        httponly=True,
+        samesite="Strict",
+        secure=True,
+    )
+
+
+def find_device_record(records: list[dict], device_id_hash: str) -> dict | None:
+    for record in records:
+        if secrets.compare_digest(str(record.get("device_id_hash", "")), device_id_hash):
+            return record
+    return None
+
+
+def device_record_payload(record: dict) -> dict:
+    return {
+        "device_id_hash": record.get("device_id_hash", ""),
+        "device_fingerprint": str(record.get("device_id_hash", ""))[:12],
+        "device_label": record.get("device_label", ""),
+        "platform": record.get("platform", "unknown"),
+        "platform_label": platform_label(record.get("platform", "unknown")),
+        "user_agent": record.get("user_agent", ""),
+        "first_seen_ip": record.get("first_seen_ip", ""),
+        "last_seen_ip": record.get("last_seen_ip", ""),
+        "request_count": int(record.get("request_count", 0) or 0),
+        "first_requested_at_display": format_display_time(datetime_from_storage(record.get("first_requested_at"))),
+        "last_requested_at_display": format_display_time(datetime_from_storage(record.get("last_requested_at"))),
+        "approved_at_display": format_display_time(datetime_from_storage(record.get("approved_at"))),
+        "last_seen_at_display": format_display_time(datetime_from_storage(record.get("last_seen_at"))),
+    }
+
+
+def current_device_status(security: dict, raw_device_id: str) -> tuple[str, dict | None]:
+    device_id_hash = hash_device_id(raw_device_id)
+    approved = find_device_record(security.get("approved_devices", []), device_id_hash)
+    if approved:
+        return "approved", approved
+    pending = find_device_record(security.get("pending_devices", []), device_id_hash)
+    if pending:
+        return "pending", pending
+    return "none", None
+
+
+def queue_device_access_request(security: dict, raw_device_id: str, device_label: str | None = None) -> dict:
+    now = utc_now()
+    device_id_hash = hash_device_id(raw_device_id)
+    remote_ip = current_device_ip()
+    platform = current_device_platform()
+    label = normalize_device_label(device_label, default_device_label(platform, remote_ip))
+    user_agent = normalize_user_agent(request.headers.get("User-Agent"))
+
+    approved = find_device_record(security.get("approved_devices", []), device_id_hash)
+    if approved:
+        approved["device_label"] = label or approved.get("device_label", "")
+        approved["last_seen_ip"] = remote_ip
+        approved["last_seen_at"] = datetime_to_storage(now)
+        if user_agent:
+            approved["user_agent"] = user_agent
+        save_security_config(security)
+        return approved
+
+    pending = find_device_record(security.get("pending_devices", []), device_id_hash)
+    if pending is None:
+        pending = {
+            "device_id_hash": device_id_hash,
+            "device_label": label,
+            "platform": platform,
+            "user_agent": user_agent,
+            "first_seen_ip": remote_ip,
+            "last_seen_ip": remote_ip,
+            "first_requested_at": datetime_to_storage(now),
+            "last_requested_at": datetime_to_storage(now),
+            "request_count": 1,
+        }
+        security.setdefault("pending_devices", []).append(pending)
+    else:
+        pending["device_label"] = label
+        pending["platform"] = platform
+        pending["user_agent"] = user_agent
+        pending["last_seen_ip"] = remote_ip
+        pending["last_requested_at"] = datetime_to_storage(now)
+        pending["request_count"] = int(pending.get("request_count", 0) or 0) + 1
+    save_security_config(security)
+    return pending
+
+
+def approve_device_request(security: dict, device_id_hash: str) -> dict:
+    pending_devices = security.get("pending_devices", [])
+    pending = find_device_record(pending_devices, device_id_hash)
+    if pending is None:
+        raise ValueError("未找到待审批设备。")
+
+    now = utc_now()
+    approved = find_device_record(security.get("approved_devices", []), device_id_hash)
+    if approved is None:
+        approved = {
+            "device_id_hash": device_id_hash,
+            "device_label": pending.get("device_label", ""),
+            "platform": pending.get("platform", "unknown"),
+            "user_agent": pending.get("user_agent", ""),
+            "first_seen_ip": pending.get("first_seen_ip", ""),
+            "last_seen_ip": pending.get("last_seen_ip", ""),
+            "approved_at": datetime_to_storage(now),
+            "last_seen_at": datetime_to_storage(now),
+            "request_count": pending.get("request_count", 1),
+        }
+        security.setdefault("approved_devices", []).append(approved)
+    else:
+        approved["device_label"] = pending.get("device_label", approved.get("device_label", ""))
+        approved["platform"] = pending.get("platform", approved.get("platform", "unknown"))
+        approved["user_agent"] = pending.get("user_agent", approved.get("user_agent", ""))
+        approved["last_seen_ip"] = pending.get("last_seen_ip", approved.get("last_seen_ip", ""))
+        approved["last_seen_at"] = datetime_to_storage(now)
+        approved.setdefault("approved_at", datetime_to_storage(now))
+        approved["request_count"] = pending.get("request_count", approved.get("request_count", 1))
+
+    security["pending_devices"] = [
+        device
+        for device in pending_devices
+        if not secrets.compare_digest(str(device.get("device_id_hash", "")), device_id_hash)
+    ]
+    save_security_config(security)
+    return approved
+
+
+def reject_device_request(security: dict, device_id_hash: str) -> bool:
+    pending_before = len(security.get("pending_devices", []))
+    security["pending_devices"] = [
+        device
+        for device in security.get("pending_devices", [])
+        if not secrets.compare_digest(str(device.get("device_id_hash", "")), device_id_hash)
+    ]
+    changed = len(security["pending_devices"]) != pending_before
+    if changed:
+        save_security_config(security)
+    return changed
+
+
+def revoke_approved_device(security: dict, device_id_hash: str) -> bool:
+    approved_before = len(security.get("approved_devices", []))
+    security["approved_devices"] = [
+        device
+        for device in security.get("approved_devices", [])
+        if not secrets.compare_digest(str(device.get("device_id_hash", "")), device_id_hash)
+    ]
+    changed = len(security["approved_devices"]) != approved_before
+    if changed:
+        save_security_config(security)
+    return changed
+
+
+def touch_approved_device(security: dict, raw_device_id: str) -> None:
+    approved = find_device_record(security.get("approved_devices", []), hash_device_id(raw_device_id))
+    if approved is None:
+        return
+    now = utc_now()
+    approved["last_seen_at"] = datetime_to_storage(now)
+    approved["last_seen_ip"] = current_device_ip()
+    user_agent = normalize_user_agent(request.headers.get("User-Agent"))
+    if user_agent:
+        approved["user_agent"] = user_agent
     save_security_config(security)
 
 
@@ -935,6 +1152,10 @@ def is_authorized_client(security: dict) -> bool:
     if is_local_admin_request():
         return True
 
+    raw_device_id = request.cookies.get(DEVICE_ID_COOKIE_NAME)
+    if raw_device_id and find_device_record(security.get("approved_devices", []), hash_device_id(raw_device_id)):
+        return True
+
     raw_token = request.cookies.get(COOKIE_NAME)
     if not raw_token:
         return False
@@ -1287,6 +1508,144 @@ read -r -p "按回车键继续..."
     return buffer.getvalue()
 
 
+def platform_label(platform: str) -> str:
+    return {
+        "ios": "iPhone / iPad",
+        "android": "Android",
+        "windows": "Windows",
+        "macos": "macOS",
+        "linux": "Linux",
+        "unknown": "未知系统",
+    }.get(platform, platform)
+
+
+def build_bundle_readme(platform_label: str, runtime: dict, install_file: str) -> str:
+    lan_url = preferred_lan_url(runtime)
+    return f"""LM Studio Translate Web 局域网接入包
+
+适用系统：
+{platform_label}
+
+1. 运行同目录下的 {install_file}
+2. 按提示把根证书导入当前系统信任区
+3. 导入完成后，在这台设备上打开：
+   {lan_url}
+4. 打开网页后点击“发送接入申请”
+5. 回到主机网页批准这台设备
+
+根证书 SHA-256 指纹：
+{runtime["ca_thumbprint_display"]}
+"""
+
+
+def build_windows_onboarding_bundle(runtime: dict) -> bytes:
+    cert_bytes = CA_CERT_PATH.read_bytes()
+    lan_url = preferred_lan_url(runtime)
+    bundle_readme = build_bundle_readme("Windows", runtime, "Install-RootCA.ps1")
+    install_script = f"""$ErrorActionPreference = "Stop"
+
+$scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+$certPath = Join-Path $scriptDir "lmstudio-translate-root-ca.crt"
+
+if (-not (Test-Path $certPath)) {{
+    throw "Certificate file not found: $certPath"
+}}
+
+Import-Certificate -FilePath $certPath -CertStoreLocation Cert:\\CurrentUser\\Root | Out-Null
+
+Write-Host ""
+Write-Host "根证书已导入当前用户信任区。" -ForegroundColor Green
+Write-Host "下一步：" -ForegroundColor Cyan
+Write-Host "1. 打开 {lan_url}"
+Write-Host "2. 在网页里点击发送接入申请"
+Write-Host "3. 回到主机网页批准这台设备"
+Write-Host ""
+Pause
+"""
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr(make_zip_info("lmstudio-translate-root-ca.crt"), cert_bytes)
+        archive.writestr(make_zip_info("Install-RootCA.ps1"), install_script.encode("utf-8"))
+        archive.writestr(make_zip_info("README.txt"), bundle_readme.encode("utf-8"))
+    return buffer.getvalue()
+
+
+def build_macos_onboarding_bundle(runtime: dict) -> bytes:
+    cert_bytes = CA_CERT_PATH.read_bytes()
+    lan_url = preferred_lan_url(runtime)
+    bundle_readme = build_bundle_readme("macOS", runtime, "Install-RootCA.command")
+    install_script = f"""#!/bin/bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+CERT_PATH="$SCRIPT_DIR/lmstudio-translate-root-ca.crt"
+
+if [ ! -f "$CERT_PATH" ]; then
+  echo "Certificate file not found: $CERT_PATH"
+  exit 1
+fi
+
+sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain "$CERT_PATH"
+
+echo ""
+echo "根证书已导入系统钥匙串。"
+echo "下一步："
+echo "1. 打开 {lan_url}"
+echo "2. 在网页里点击发送接入申请"
+echo "3. 回到主机网页批准这台设备"
+echo ""
+read -r -p "按回车键继续..."
+"""
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr(make_zip_info("lmstudio-translate-root-ca.crt"), cert_bytes)
+        archive.writestr(make_zip_info("Install-RootCA.command", executable=True), install_script.encode("utf-8"))
+        archive.writestr(make_zip_info("README.txt"), bundle_readme.encode("utf-8"))
+    return buffer.getvalue()
+
+
+def build_linux_onboarding_bundle(runtime: dict) -> bytes:
+    cert_bytes = CA_CERT_PATH.read_bytes()
+    lan_url = preferred_lan_url(runtime)
+    bundle_readme = build_bundle_readme("Linux", runtime, "install-root-ca.sh")
+    install_script = f"""#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+CERT_PATH="$SCRIPT_DIR/lmstudio-translate-root-ca.crt"
+
+if [[ ! -f "$CERT_PATH" ]]; then
+  echo "Certificate file not found: $CERT_PATH"
+  exit 1
+fi
+
+if command -v update-ca-certificates >/dev/null 2>&1; then
+  sudo cp "$CERT_PATH" /usr/local/share/ca-certificates/lmstudio-translate-root-ca.crt
+  sudo update-ca-certificates
+elif command -v update-ca-trust >/dev/null 2>&1; then
+  sudo cp "$CERT_PATH" /etc/pki/ca-trust/source/anchors/lmstudio-translate-root-ca.crt
+  sudo update-ca-trust
+else
+  echo "未检测到常见证书更新命令。请手动把证书导入系统信任区。"
+fi
+
+echo ""
+echo "根证书导入流程已完成。"
+echo "下一步："
+echo "1. 打开 {lan_url}"
+echo "2. 在网页里点击发送接入申请"
+echo "3. 回到主机网页批准这台设备"
+echo ""
+read -r -p "按回车键继续..."
+"""
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr(make_zip_info("lmstudio-translate-root-ca.crt"), cert_bytes)
+        archive.writestr(make_zip_info("install-root-ca.sh", executable=True), install_script.encode("utf-8"))
+        archive.writestr(make_zip_info("README.txt"), bundle_readme.encode("utf-8"))
+    return buffer.getvalue()
+
+
 def build_qr_svg_data_uri(value: str) -> str:
     qr = qrcode.QRCode(border=1, box_size=8)
     qr.add_data(value)
@@ -1390,9 +1749,41 @@ def build_platform_onboarding_bundle(runtime: dict, platform: str) -> tuple[byte
     return build_windows_onboarding_bundle(runtime), "lmstudio-lan-windows-bundle.zip"
 
 
+def summarize_device_access(security: dict) -> dict:
+    pending_devices = sorted(
+        (device_record_payload(device) for device in security.get("pending_devices", [])),
+        key=lambda item: item.get("last_requested_at_display", ""),
+        reverse=True,
+    )
+    approved_devices = sorted(
+        (device_record_payload(device) for device in security.get("approved_devices", [])),
+        key=lambda item: item.get("last_seen_at_display", ""),
+        reverse=True,
+    )
+    return {
+        "pending_devices": pending_devices,
+        "approved_devices": approved_devices,
+        "pending_count": len(pending_devices),
+        "approved_count": len(approved_devices),
+    }
+
+
+def build_access_request_context(security: dict, raw_device_id: str) -> dict:
+    platform = current_device_platform()
+    remote_ip = current_device_ip()
+    status, record = current_device_status(security, raw_device_id)
+    record_payload = device_record_payload(record) if record else None
+    return {
+        "access_status": status,
+        "device_label": (record or {}).get("device_label") or default_device_label(platform, remote_ip),
+        "device_platform_label": platform_label(platform),
+        "device_ip": remote_ip,
+        "request_record": record_payload,
+    }
+
+
 def prepare_runtime() -> dict:
     security = load_security_config()
-    pin, pin_expires_at = ensure_active_pairing_pin(security)
     ca_key, ca_cert = ensure_ca_certificate()
     ensure_server_certificate(ca_key, ca_cert)
     thumbprint = certificate_thumbprint(ca_cert)
@@ -1405,6 +1796,7 @@ def prepare_runtime() -> dict:
         if bootstrap_urls
         else (hostname_bootstrap_urls[0] if hostname_bootstrap_urls else f"http://127.0.0.1:{BOOTSTRAP_PORT}/bootstrap")
     )
+    device_access = summarize_device_access(security)
 
     return {
         "local_url": f"https://127.0.0.1:{APP_PORT}/",
@@ -1414,13 +1806,12 @@ def prepare_runtime() -> dict:
         "hostname_bootstrap_urls": hostname_bootstrap_urls,
         "preferred_bootstrap_url": preferred_bootstrap_url,
         "mobile_bootstrap_qr_data_uri": build_qr_svg_data_uri(preferred_bootstrap_url),
-        "pairing_pin": pin,
-        "pairing_pin_expires_at_display": format_display_time(pin_expires_at),
         "ca_cert_path": str(CA_CERT_PATH),
         "ca_thumbprint": thumbprint,
         "ca_thumbprint_display": format_thumbprint(thumbprint),
         "server_cert_path": str(SERVER_CERT_PATH),
         "server_key_path": str(SERVER_KEY_PATH),
+        **device_access,
     }
 
 
@@ -1495,7 +1886,7 @@ def restrict_client_network():
     security = load_security_config()
     protected_endpoints = {"api_models", "api_translate"}
     if request.endpoint in protected_endpoints and not is_authorized_client(security):
-        return jsonify({"ok": False, "error": "未授权。请先输入 6 位 PIN。"}), 403
+        return jsonify({"ok": False, "error": "未授权。请先发送接入申请，并等待主端批准。"}), 403
 
 
 @app.after_request
@@ -1524,8 +1915,25 @@ def index():
 
     security = load_security_config()
     runtime = prepare_runtime()
+    raw_device_id, should_set_device_cookie = ensure_device_id()
     if not is_authorized_client(security):
-        return render_template("login.html", error_message="")
+        response = make_response(
+            render_template(
+                "login.html",
+                error_message="",
+                **build_access_request_context(security, raw_device_id),
+            )
+        )
+        if should_set_device_cookie:
+            attach_device_cookie(response, raw_device_id)
+        return response
+
+    if not is_local_admin_request():
+        if find_device_record(security.get("approved_devices", []), hash_device_id(raw_device_id)) is None:
+            queue_device_access_request(security, raw_device_id)
+            approve_device_request(security, hash_device_id(raw_device_id))
+            security = load_security_config()
+        touch_approved_device(security, raw_device_id)
 
     config = load_config()
     base_url, models, model_error = resolve_lmstudio_base_url(config)
@@ -1535,69 +1943,98 @@ def index():
         config["model_name"] = pick_default_model(models)
     save_config(config)
 
-    return render_template(
-        "index.html",
-        config=config,
-        models=models,
-        language_options=LANGUAGE_OPTIONS,
-        initial_error=model_error or "",
-        lan_urls=runtime["lan_urls"] if is_local_admin_request() else [],
-        hostname_urls=runtime["hostname_urls"] if is_local_admin_request() else [],
-        bootstrap_urls=runtime["bootstrap_urls"] if is_local_admin_request() else [],
-        hostname_bootstrap_urls=runtime["hostname_bootstrap_urls"] if is_local_admin_request() else [],
-        preferred_bootstrap_url=runtime["preferred_bootstrap_url"] if is_local_admin_request() else "",
-        mobile_bootstrap_qr_data_uri=runtime["mobile_bootstrap_qr_data_uri"] if is_local_admin_request() else "",
-        pairing_pin=runtime["pairing_pin"] if is_local_admin_request() else "",
-        pairing_pin_expires_at_display=runtime["pairing_pin_expires_at_display"] if is_local_admin_request() else "",
-        ca_thumbprint_display=runtime["ca_thumbprint_display"] if is_local_admin_request() else "",
+    response = make_response(
+        render_template(
+            "index.html",
+            config=config,
+            models=models,
+            language_options=LANGUAGE_OPTIONS,
+            initial_error=model_error or "",
+            lan_urls=runtime["lan_urls"] if is_local_admin_request() else [],
+            hostname_urls=runtime["hostname_urls"] if is_local_admin_request() else [],
+            bootstrap_urls=runtime["bootstrap_urls"] if is_local_admin_request() else [],
+            hostname_bootstrap_urls=runtime["hostname_bootstrap_urls"] if is_local_admin_request() else [],
+            preferred_bootstrap_url=runtime["preferred_bootstrap_url"] if is_local_admin_request() else "",
+            mobile_bootstrap_qr_data_uri=runtime["mobile_bootstrap_qr_data_uri"] if is_local_admin_request() else "",
+            ca_thumbprint_display=runtime["ca_thumbprint_display"] if is_local_admin_request() else "",
+            pending_devices=runtime["pending_devices"] if is_local_admin_request() else [],
+            approved_devices=runtime["approved_devices"] if is_local_admin_request() else [],
+            pending_count=runtime["pending_count"] if is_local_admin_request() else 0,
+            approved_count=runtime["approved_count"] if is_local_admin_request() else 0,
+            local_admin=is_local_admin_request(),
+        )
     )
+    if should_set_device_cookie and not is_local_admin_request():
+        attach_device_cookie(response, raw_device_id)
+    return response
 
 
-@app.post("/login")
-def login():
+@app.post("/access/request")
+def access_request():
     security = load_security_config()
-    pin = request.form.get("pairing_pin", "").strip()
-    remember_device = request.form.get("remember_device") == "1"
-    if not verify_pairing_pin(security, pin):
-        return render_template("login.html", error_message="PIN 错误或已过期。"), 403
-
-    device_token, expires_at = create_device_session(security, remember_device)
-    response = make_response(redirect(url_for("index")))
-    response.set_cookie(
-        COOKIE_NAME,
-        device_token,
-        max_age=int((expires_at - utc_now()).total_seconds()),
-        httponly=True,
-        samesite="Strict",
-        secure=True,
+    raw_device_id, should_set_device_cookie = ensure_device_id()
+    payload = request.get_json(silent=True) or {}
+    record = queue_device_access_request(security, raw_device_id, payload.get("device_label"))
+    approved = find_device_record(security.get("approved_devices", []), hash_device_id(raw_device_id)) is not None
+    message = "这台设备已经被批准，正在进入翻译页。" if approved else "接入申请已提交，请到主端网页批准这台设备。"
+    response = make_response(
+        jsonify(
+            {
+                "ok": True,
+                "status": "approved" if approved else "pending",
+                "message": message,
+                "request_record": device_record_payload(record),
+            }
+        )
     )
+    if should_set_device_cookie:
+        attach_device_cookie(response, raw_device_id)
+    return response
+
+
+@app.get("/access/status")
+def access_status():
+    security = load_security_config()
+    raw_device_id, should_set_device_cookie = ensure_device_id()
+    status, record = current_device_status(security, raw_device_id)
+    response = make_response(
+        jsonify(
+            {
+                "ok": True,
+                "status": status,
+                "authorized": status == "approved",
+                "request_record": device_record_payload(record) if record else None,
+            }
+        )
+    )
+    if should_set_device_cookie:
+        attach_device_cookie(response, raw_device_id)
     return response
 
 
 @app.post("/logout")
 def logout():
     security = load_security_config()
+    raw_device_id = request.cookies.get(DEVICE_ID_COOKIE_NAME)
+    if raw_device_id:
+        device_id_hash = hash_device_id(raw_device_id)
+        revoke_approved_device(security, device_id_hash)
+        reject_device_request(security, device_id_hash)
     remove_device_session(security, request.cookies.get(COOKIE_NAME))
     response = make_response(redirect(url_for("index")))
     response.delete_cookie(COOKIE_NAME)
+    response.delete_cookie(DEVICE_ID_COOKIE_NAME)
     return response
+
+
+@app.post("/login")
+def login():
+    return make_response(("此版本已改为主端审批，不再使用 PIN 登录。", 410))
 
 
 @app.post("/admin/pin/regenerate")
 def regenerate_pin():
-    if not is_local_admin_request():
-        return jsonify({"ok": False, "error": "只有本机管理员可以重新生成 PIN。"}), 403
-
-    security = load_security_config()
-    pin, expires_at = issue_pairing_pin(security)
-    return jsonify(
-        {
-            "ok": True,
-            "pairing_pin": pin,
-            "pairing_pin_expires_at_display": format_display_time(expires_at),
-            "message": "已生成新的 6 位 PIN。",
-        }
-    )
+    return jsonify({"ok": False, "error": "此版本已改为主端审批，不再使用 PIN。"}), 410
 
 
 @app.get("/admin/runtime")
@@ -1615,6 +2052,90 @@ def admin_runtime():
             "hostname_bootstrap_urls": runtime["hostname_bootstrap_urls"],
             "preferred_bootstrap_url": runtime["preferred_bootstrap_url"],
             "mobile_bootstrap_qr_data_uri": runtime["mobile_bootstrap_qr_data_uri"],
+            "pending_devices": runtime["pending_devices"],
+            "approved_devices": runtime["approved_devices"],
+            "pending_count": runtime["pending_count"],
+            "approved_count": runtime["approved_count"],
+        }
+    )
+
+
+@app.post("/admin/access/approve")
+def approve_access_device():
+    if not is_local_admin_request():
+        return jsonify({"ok": False, "error": "仅允许本机管理员审批设备。"}), 403
+
+    payload = request.get_json(silent=True) or {}
+    device_id_hash = str(payload.get("device_id_hash", "")).strip()
+    if not device_id_hash:
+        return jsonify({"ok": False, "error": "缺少设备标识。"}), 400
+
+    security = load_security_config()
+    try:
+        approve_device_request(security, device_id_hash)
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 404
+    runtime = prepare_runtime()
+    return jsonify(
+        {
+            "ok": True,
+            "message": "已批准这台设备，后续它会长期保持访问权限，直到你手动撤销。",
+            "pending_devices": runtime["pending_devices"],
+            "approved_devices": runtime["approved_devices"],
+            "pending_count": runtime["pending_count"],
+            "approved_count": runtime["approved_count"],
+        }
+    )
+
+
+@app.post("/admin/access/reject")
+def reject_access_device():
+    if not is_local_admin_request():
+        return jsonify({"ok": False, "error": "仅允许本机管理员拒绝设备。"}), 403
+
+    payload = request.get_json(silent=True) or {}
+    device_id_hash = str(payload.get("device_id_hash", "")).strip()
+    if not device_id_hash:
+        return jsonify({"ok": False, "error": "缺少设备标识。"}), 400
+
+    security = load_security_config()
+    if not reject_device_request(security, device_id_hash):
+        return jsonify({"ok": False, "error": "未找到待审批设备。"}), 404
+    runtime = prepare_runtime()
+    return jsonify(
+        {
+            "ok": True,
+            "message": "已拒绝这台设备的接入申请。",
+            "pending_devices": runtime["pending_devices"],
+            "approved_devices": runtime["approved_devices"],
+            "pending_count": runtime["pending_count"],
+            "approved_count": runtime["approved_count"],
+        }
+    )
+
+
+@app.post("/admin/access/revoke")
+def revoke_access_device():
+    if not is_local_admin_request():
+        return jsonify({"ok": False, "error": "仅允许本机管理员撤销设备。"}), 403
+
+    payload = request.get_json(silent=True) or {}
+    device_id_hash = str(payload.get("device_id_hash", "")).strip()
+    if not device_id_hash:
+        return jsonify({"ok": False, "error": "缺少设备标识。"}), 400
+
+    security = load_security_config()
+    if not revoke_approved_device(security, device_id_hash):
+        return jsonify({"ok": False, "error": "未找到已批准设备。"}), 404
+    runtime = prepare_runtime()
+    return jsonify(
+        {
+            "ok": True,
+            "message": "已撤销这台设备的长期访问权限。",
+            "pending_devices": runtime["pending_devices"],
+            "approved_devices": runtime["approved_devices"],
+            "pending_count": runtime["pending_count"],
+            "approved_count": runtime["approved_count"],
         }
     )
 
