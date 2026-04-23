@@ -30,12 +30,14 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 from flask import (
     Flask,
+    Response,
     jsonify,
     make_response,
     redirect,
     render_template,
     request,
     send_file,
+    stream_with_context,
     url_for,
 )
 from requests import exceptions as request_exceptions
@@ -1070,6 +1072,254 @@ def split_text_for_translation(text: str, max_chars: int) -> list[str]:
     return chunks
 
 
+def split_text_for_translation_v2(text: str, max_chars: int) -> list[str]:
+    def find_split_at(segment: str, preferred: int, hard_limit: int) -> int:
+        lower_bound = max(1, int(preferred * 0.45))
+        window = segment[:hard_limit]
+        primary_markers = ["\n\n", "\n", "。", "！", "？", "…", ".", "!", "?"]
+        secondary_markers = ["；", ";", "：", ":", "，", ",", "、", "）", ")", "]", "”", "\"", "'", " "]
+
+        best = -1
+        for marker in primary_markers:
+            index = window.rfind(marker, lower_bound)
+            if index != -1:
+                best = max(best, index + len(marker))
+        if best > 0:
+            return best
+
+        for marker in secondary_markers:
+            index = window.rfind(marker, lower_bound)
+            if index != -1:
+                best = max(best, index + len(marker))
+        if best > 0:
+            return best
+
+        next_window = segment[: min(len(segment), hard_limit + max(24, preferred // 8))]
+        next_space = next_window.find(" ", preferred)
+        if next_space != -1:
+            return next_space + 1
+        return hard_limit
+
+    def split_oversized_segment(segment: str) -> list[str]:
+        pieces: list[str] = []
+        remaining = segment.strip()
+        while len(remaining) > max_chars:
+            hard_limit = min(len(remaining), max_chars + max(24, max_chars // 8))
+            split_at = find_split_at(remaining, max_chars, hard_limit)
+            piece = remaining[:split_at].strip()
+            if not piece:
+                split_at = min(len(remaining), hard_limit)
+                piece = remaining[:split_at].strip()
+            pieces.append(piece)
+            remaining = remaining[split_at:].lstrip()
+        if remaining:
+            pieces.append(remaining)
+        return pieces
+
+    normalized = text.replace("\r\n", "\n").strip()
+    if not normalized:
+        return []
+
+    paragraph_groups = [part.strip() for part in re.split(r"\n{2,}", normalized) if part.strip()]
+    if not paragraph_groups:
+        return []
+
+    sentence_pattern = re.compile(r".+?(?:[。！？!?…]+|[.;；:：](?=\s)|\n|$)", re.S)
+    chunks: list[str] = []
+    current = ""
+
+    def flush_current() -> None:
+        nonlocal current
+        if current.strip():
+            chunks.append(current.strip())
+        current = ""
+
+    for paragraph in paragraph_groups:
+        if len(paragraph) <= max_chars:
+            candidate = f"{current}\n\n{paragraph}".strip() if current else paragraph
+            if len(candidate) <= max_chars:
+                current = candidate
+                continue
+            flush_current()
+            current = paragraph
+            continue
+
+        sentences = [match.group(0).strip() for match in sentence_pattern.finditer(paragraph) if match.group(0).strip()]
+        if not sentences:
+            sentences = [paragraph]
+
+        for sentence in sentences:
+            fragments = [sentence] if len(sentence) <= max_chars else split_oversized_segment(sentence)
+            for fragment in fragments:
+                separator = "\n\n" if current else ""
+                candidate = f"{current}{separator}{fragment}" if current else fragment
+                if len(candidate) <= max_chars:
+                    current = candidate.strip()
+                    continue
+                flush_current()
+                if len(fragment) <= max_chars:
+                    current = fragment.strip()
+                    continue
+                for forced in split_oversized_segment(fragment):
+                    if len(forced) <= max_chars:
+                        if current:
+                            flush_current()
+                        current = forced.strip()
+                    else:
+                        chunks.append(forced[:max_chars].strip())
+        flush_current()
+
+    flush_current()
+    return [chunk for chunk in chunks if chunk]
+
+
+def split_text_for_translation_v3(text: str, max_chars: int) -> list[str]:
+    normalized = text.replace("\r\n", "\n").strip()
+    if not normalized:
+        return []
+
+    overflow = max(24, max_chars // 8)
+    lower_bound = max(1, int(max_chars * 0.55))
+    boundary_groups = [
+        ["\n\n", "\n"],
+        ["。", "！", "？", "……", "…", ".", "!", "?"],
+        ["；", ";", "：", ":", "，", ",", "、", ")", "]", "}", "”", "\"", "'"],
+        [" "],
+    ]
+
+    def find_first(markers: list[str], segment: str, start: int, end: int) -> int:
+        best: int | None = None
+        for marker in markers:
+            index = segment.find(marker, start, end)
+            if index != -1:
+                candidate = index + len(marker)
+                if best is None or candidate < best:
+                    best = candidate
+        return best or -1
+
+    def find_last(markers: list[str], segment: str, start: int, end: int) -> int:
+        best = -1
+        for marker in markers:
+            index = segment.rfind(marker, start, end)
+            if index != -1:
+                best = max(best, index + len(marker))
+        return best
+
+    def choose_split_point(segment: str) -> int:
+        if len(segment) <= max_chars:
+            return len(segment)
+
+        hard_limit = min(len(segment), max_chars + overflow)
+        preferred = max_chars
+        tiny_tail_threshold = max(12, max_chars // 4)
+
+        if len(segment) <= hard_limit:
+            for markers in boundary_groups:
+                split_at = find_first(markers, segment, preferred, len(segment))
+                if split_at != -1:
+                    return split_at
+            return len(segment)
+
+        for markers in boundary_groups:
+            backward = find_last(markers, segment, lower_bound, preferred + 1)
+            if backward != -1:
+                remainder = len(segment) - backward
+                if remainder < tiny_tail_threshold:
+                    forward = find_first(markers, segment, preferred, hard_limit + 1)
+                    if forward != -1:
+                        return forward
+                return backward
+
+        for markers in boundary_groups:
+            forward = find_first(markers, segment, preferred, hard_limit + 1)
+            if forward != -1:
+                return forward
+
+        return hard_limit
+
+    chunks: list[str] = []
+    remaining = normalized
+
+    while remaining:
+        if len(remaining) <= max_chars:
+            chunks.append(remaining.strip())
+            break
+
+        split_at = choose_split_point(remaining)
+        piece = remaining[:split_at].strip()
+        if not piece:
+            split_at = min(len(remaining), max_chars)
+            piece = remaining[:split_at].strip()
+
+        chunks.append(piece)
+        remaining = remaining[split_at:].lstrip()
+
+    return [chunk for chunk in chunks if chunk]
+
+
+def extract_stream_delta(payload: dict) -> str:
+    choices = payload.get("choices") or []
+    if not choices:
+        return ""
+    choice = choices[0] or {}
+    delta = choice.get("delta") or {}
+    if isinstance(delta, dict) and delta.get("content"):
+        return str(delta.get("content"))
+    if choice.get("text"):
+        return str(choice.get("text"))
+    message = choice.get("message") or {}
+    if isinstance(message, dict) and message.get("content"):
+        return str(message.get("content"))
+    return ""
+
+
+def request_translation_stream(config: dict, plan: dict, base_url: str, text: str):
+    max_tokens = estimate_completion_tokens(plan, text)
+    translated = ""
+    with make_session() as session:
+        with session.post(
+            f"{base_url}/chat/completions",
+            headers={
+                "Authorization": f"Bearer {config['api_key']}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": config["model_name"],
+                "messages": build_messages(text, config["source_lang"], config["target_lang"]),
+                "temperature": config["temperature"],
+                "max_tokens": max_tokens,
+                "stream": True,
+            },
+            timeout=int(plan["effective_timeout"]),
+            stream=True,
+        ) as response:
+            response.raise_for_status()
+            response.encoding = "utf-8"
+            for raw_line in response.iter_lines(decode_unicode=True):
+                if not raw_line:
+                    continue
+                line = raw_line.strip()
+                if not line.startswith("data:"):
+                    continue
+                payload = line[5:].strip()
+                if not payload or payload == "[DONE]":
+                    continue
+                event = json.loads(payload)
+                delta = extract_stream_delta(event)
+                if not delta:
+                    continue
+                translated += delta
+                yield translated
+
+    translated = translated.strip()
+    if not translated:
+        raise ValueError("LM Studio 返回了空结果。请尝试更换模型，或调大最大输出 Tokens。")
+
+
+def join_translated_chunks(translated_chunks: list[str]) -> str:
+    return ("\n\n".join(chunk for chunk in translated_chunks if chunk)).strip()
+
+
 def request_translation(config: dict, plan: dict, base_url: str, text: str) -> str:
     max_tokens = estimate_completion_tokens(plan, text)
     with make_session() as session:
@@ -1098,13 +1348,42 @@ def request_translation(config: dict, plan: dict, base_url: str, text: str) -> s
 
 
 def translate_text(config: dict, plan: dict, base_url: str, text: str) -> tuple[str, int]:
-    chunks = split_text_for_translation(text, estimate_chunk_char_limit(plan))
+    chunks = split_text_for_translation_v3(text, estimate_chunk_char_limit(plan))
     if not chunks:
         return "", 0
 
     translated_chunks = [request_translation(config, plan, base_url, chunk) for chunk in chunks]
     joiner = "\n\n" if len(translated_chunks) > 1 else ""
     return joiner.join(translated_chunks), len(translated_chunks)
+
+
+def stream_translate_text(config: dict, plan: dict, base_url: str, text: str):
+    chunks = split_text_for_translation_v3(text, estimate_chunk_char_limit(plan))
+    if not chunks:
+        return
+
+    translated_chunks = [""] * len(chunks)
+    for chunk_index, chunk in enumerate(chunks, start=1):
+        last_value = ""
+        for partial in request_translation_stream(config, plan, base_url, chunk):
+            last_value = partial
+            translated_chunks[chunk_index - 1] = partial.strip()
+            yield {
+                "event": "progress",
+                "chunk_index": chunk_index,
+                "chunk_count": len(chunks),
+                "translated_chunk": partial.strip(),
+                "translated_text": join_translated_chunks(translated_chunks),
+            }
+
+        translated_chunks[chunk_index - 1] = last_value.strip()
+        yield {
+            "event": "chunk_done",
+            "chunk_index": chunk_index,
+            "chunk_count": len(chunks),
+            "translated_chunk": translated_chunks[chunk_index - 1],
+            "translated_text": join_translated_chunks(translated_chunks),
+        }
 
 
 def sanitize_config(payload: dict) -> dict:
@@ -1884,7 +2163,7 @@ def restrict_client_network():
         return None
 
     security = load_security_config()
-    protected_endpoints = {"api_models", "api_translate"}
+    protected_endpoints = {"api_models", "api_translate", "api_translate_stream"}
     if request.endpoint in protected_endpoints and not is_authorized_client(security):
         return jsonify({"ok": False, "error": "未授权。请先发送接入申请，并等待主端批准。"}), 403
 
@@ -2305,6 +2584,136 @@ def api_translate():
             "queue_position_at_submit": queue_state["queued_ahead"] + 1,
         }
     )
+
+
+@app.post("/api/translate/stream")
+def api_translate_stream():
+    payload = request.get_json(silent=True) or {}
+    config = sanitize_config(payload)
+    source_text = str(payload.get("source_text", "")).strip()
+
+    if not source_text:
+        return jsonify({"ok": False, "error": "请输入要翻译的文本。"}), 400
+
+    base_url, models, error_message = resolve_lmstudio_base_url(config)
+    if error_message:
+        return jsonify({"ok": False, "error": error_message}), 400
+
+    config["base_url"] = base_url or config["base_url"]
+    if models and (not config["model_name"] or config["model_name"] not in models):
+        config["model_name"] = pick_default_model(models)
+
+    if not config["model_name"]:
+        return jsonify({"ok": False, "error": "请先选择或手动填写模型名。"}), 400
+
+    save_config(config)
+    queue_state = TRANSLATION_QUEUE.acquire()
+    plan = build_translation_plan(config, source_text)
+    chunks = split_text_for_translation_v3(source_text, estimate_chunk_char_limit(plan))
+
+    def stream_event(payload: dict) -> str:
+        return json.dumps(payload, ensure_ascii=False) + "\n"
+
+    def build_completion_message(chunk_count: int) -> str:
+        message = "翻译完成。"
+        if chunk_count > 1:
+            message = f"长文本已自动分段翻译，共 {chunk_count} 段。"
+        if queue_state["queued_ahead"] > 0 or queue_state["wait_ms"] >= 200:
+            message += (
+                f" 提交时前面有 {queue_state['queued_ahead']} 个任务，"
+                f"等待 {round(queue_state['wait_ms'] / 1000, 2)} 秒后开始。"
+            )
+        return message
+
+    @stream_with_context
+    def generate():
+        started_at = time.perf_counter()
+        translated_chunks = [""] * len(chunks)
+        try:
+            yield stream_event(
+                {
+                    "ok": True,
+                    "event": "start",
+                    "chunk_count": len(chunks),
+                    "queue_wait_ms": queue_state["wait_ms"],
+                    "queue_wait_seconds": round(queue_state["wait_ms"] / 1000, 2),
+                    "queue_position_at_submit": queue_state["queued_ahead"] + 1,
+                }
+            )
+
+            for chunk_index, chunk in enumerate(chunks, start=1):
+                last_partial = ""
+                for partial in request_translation_stream(config, plan, config["base_url"], chunk):
+                    last_partial = partial.strip()
+                    translated_chunks[chunk_index - 1] = last_partial
+                    partial_ratio = (
+                        (chunk_index - 1)
+                        + min(0.92, max(0.08, len(last_partial) / max(1, len(chunk))))
+                    ) / max(1, len(chunks))
+                    yield stream_event(
+                        {
+                            "ok": True,
+                            "event": "progress",
+                            "chunk_index": chunk_index,
+                            "chunk_count": len(chunks),
+                            "translated_chunk": last_partial,
+                            "translated_text": join_translated_chunks(translated_chunks),
+                            "progress_ratio": round(partial_ratio, 4),
+                        }
+                    )
+
+                translated_chunks[chunk_index - 1] = last_partial
+                yield stream_event(
+                    {
+                        "ok": True,
+                        "event": "chunk_done",
+                        "chunk_index": chunk_index,
+                        "chunk_count": len(chunks),
+                        "translated_chunk": last_partial,
+                        "translated_text": join_translated_chunks(translated_chunks),
+                        "progress_ratio": round(chunk_index / max(1, len(chunks)), 4),
+                    }
+                )
+
+            elapsed_ms = round((time.perf_counter() - started_at) * 1000, 1)
+            yield stream_event(
+                {
+                    "ok": True,
+                    "event": "done",
+                    "translated_text": join_translated_chunks(translated_chunks),
+                    "base_url": config["base_url"],
+                    "message": build_completion_message(len(chunks)),
+                    "model_name": config["model_name"],
+                    "chunk_count": len(chunks),
+                    "elapsed_ms": elapsed_ms,
+                    "elapsed_seconds": round(elapsed_ms / 1000, 2),
+                    "effective_max_tokens": plan["effective_max_tokens"],
+                    "configured_max_tokens": plan["configured_max_tokens"],
+                    "chunk_char_limit": plan["chunk_char_limit"],
+                    "effective_timeout": plan["effective_timeout"],
+                    "hardware_tier": plan["hardware_tier"],
+                    "estimated_chunk_count": plan["estimated_chunk_count"],
+                    "tuning_summary": plan["tuning_summary"],
+                    "auto_tokens_enabled": plan["auto_tokens_enabled"],
+                    "gpu": gpu_snapshot_response(plan["gpu_snapshot"]),
+                    "system": system_snapshot_response(plan["memory_snapshot"]),
+                    "queue_wait_ms": queue_state["wait_ms"],
+                    "queue_wait_seconds": round(queue_state["wait_ms"] / 1000, 2),
+                    "queue_position_at_submit": queue_state["queued_ahead"] + 1,
+                }
+            )
+        except Exception as exc:
+            yield stream_event(
+                {
+                    "ok": False,
+                    "event": "error",
+                    "error": format_request_error(exc, "翻译"),
+                }
+            )
+        finally:
+            TRANSLATION_QUEUE.release()
+
+    return Response(generate(), content_type="application/x-ndjson; charset=utf-8")
 
 
 if __name__ == "__main__":

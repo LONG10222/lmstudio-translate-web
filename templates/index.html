@@ -364,9 +364,6 @@
             refreshAccessAdmin: document.getElementById("refresh_access_admin"),
         };
 
-        let progressTimer = null;
-        let progressValue = 0;
-
         function payloadFromForm() {
             return {
                 base_url: elements.baseUrl.value.trim(),
@@ -386,13 +383,16 @@
             elements.message.classList.add(kind);
         }
 
+        function setProgress(percent, label, isError = false) {
+            const clamped = Math.max(0, Math.min(100, Math.round(percent)));
+            elements.progressLabel.textContent = label;
+            elements.progressPercent.textContent = `${clamped}%`;
+            elements.progressBar.style.width = `${clamped}%`;
+            elements.progressBar.classList.toggle("is-error", isError);
+        }
+
         function setIdleProgress() {
-            clearInterval(progressTimer);
-            progressTimer = null;
-            progressValue = 0;
-            elements.progressLabel.textContent = "待命";
-            elements.progressPercent.textContent = "0%";
-            elements.progressBar.style.width = "0%";
+            setProgress(0, "待命");
             elements.progressBar.classList.remove("is-error");
         }
 
@@ -410,32 +410,6 @@
                 ? `${data.effective_max_tokens} / ${data.configured_max_tokens} · ${data.chunk_char_limit} 字/段`
                 : `${data.effective_max_tokens} · ${data.chunk_char_limit} 字/段`;
             elements.tuningSummary.textContent = data.tuning_summary || "未读取";
-        }
-
-        function startProgress() {
-            clearInterval(progressTimer);
-            progressValue = 8;
-            elements.progressLabel.textContent = "正在翻译";
-            elements.progressPercent.textContent = `${progressValue}%`;
-            elements.progressBar.style.width = `${progressValue}%`;
-            elements.progressBar.classList.remove("is-error");
-            progressTimer = setInterval(() => {
-                if (progressValue < 90) {
-                    progressValue += progressValue < 60 ? 7 : 3;
-                    elements.progressPercent.textContent = `${progressValue}%`;
-                    elements.progressBar.style.width = `${progressValue}%`;
-                }
-            }, 220);
-        }
-
-        function finishProgress(success) {
-            clearInterval(progressTimer);
-            progressTimer = null;
-            progressValue = 100;
-            elements.progressLabel.textContent = success ? "翻译成功" : "翻译失败";
-            elements.progressPercent.textContent = "100%";
-            elements.progressBar.style.width = "100%";
-            elements.progressBar.classList.toggle("is-error", !success);
         }
 
         async function postJson(url, payload) {
@@ -465,6 +439,53 @@
                 throw new Error(data.error || "请求失败。");
             }
             return data;
+        }
+
+        async function streamJson(url, payload, onEvent) {
+            const response = await fetch(url, {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json",
+                },
+                body: JSON.stringify(payload),
+                credentials: "same-origin",
+            });
+
+            if (!response.ok || !response.body) {
+                let message = "请求失败。";
+                try {
+                    const data = await response.json();
+                    message = data.error || message;
+                } catch (error) {
+                }
+                throw new Error(message);
+            }
+
+            const reader = response.body.getReader();
+            const decoder = new TextDecoder("utf-8");
+            let buffer = "";
+
+            while (true) {
+                const { done, value } = await reader.read();
+                if (done) {
+                    break;
+                }
+                buffer += decoder.decode(value, { stream: true });
+                let newlineIndex = buffer.indexOf("\n");
+                while (newlineIndex !== -1) {
+                    const line = buffer.slice(0, newlineIndex).trim();
+                    buffer = buffer.slice(newlineIndex + 1);
+                    if (line) {
+                        onEvent(JSON.parse(line));
+                    }
+                    newlineIndex = buffer.indexOf("\n");
+                }
+            }
+
+            const trailing = buffer.trim();
+            if (trailing) {
+                onEvent(JSON.parse(trailing));
+            }
         }
 
         function renderUrlList(target, values) {
@@ -670,24 +691,51 @@
             }
 
             elements.translateButton.disabled = true;
-            startProgress();
+            elements.translatedText.value = "";
             resetRuntimeMetrics();
+            setProgress(6, "准备翻译");
 
             try {
-                const data = await postJson("/api/translate", payloadFromForm());
-                elements.translatedText.value = data.translated_text;
-                if (data.model_name) {
-                    elements.modelName.value = data.model_name;
-                }
-                if (data.base_url) {
-                    elements.baseUrl.value = data.base_url;
-                }
-                updateRuntimeMetrics(data);
-                finishProgress(true);
-                setMessage(data.message, "success");
+                await streamJson("/api/translate/stream", payloadFromForm(), (event) => {
+                    if (!event.ok) {
+                        throw new Error(event.error || "翻译失败。");
+                    }
+
+                    if (event.event === "start") {
+                        const queueMessage = event.queue_wait_seconds > 0
+                            ? `任务已排队，等待 ${event.queue_wait_seconds} 秒后开始。`
+                            : "开始翻译。";
+                        setMessage(queueMessage, "success");
+                        setProgress(8, event.chunk_count > 1 ? `开始翻译，共 ${event.chunk_count} 段` : "开始翻译");
+                        return;
+                    }
+
+                    if (event.event === "progress" || event.event === "chunk_done") {
+                        elements.translatedText.value = event.translated_text || "";
+                        const ratio = Math.max(0.08, Math.min(0.96, Number(event.progress_ratio || 0)));
+                        const percent = Math.round(ratio * 100);
+                        const label = event.chunk_count > 1
+                            ? `正在翻译第 ${event.chunk_index} / ${event.chunk_count} 段`
+                            : "正在翻译";
+                        setProgress(percent, label);
+                        return;
+                    }
+
+                    if (event.event === "done") {
+                        elements.translatedText.value = event.translated_text || "";
+                        if (event.model_name) {
+                            elements.modelName.value = event.model_name;
+                        }
+                        if (event.base_url) {
+                            elements.baseUrl.value = event.base_url;
+                        }
+                        updateRuntimeMetrics(event);
+                        setProgress(100, "翻译成功");
+                        setMessage(event.message, "success");
+                    }
+                });
             } catch (error) {
-                elements.translatedText.value = "";
-                finishProgress(false);
+                setProgress(100, "翻译失败", true);
                 setMessage(error.message, "error");
             } finally {
                 elements.translateButton.disabled = false;
